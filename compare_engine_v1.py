@@ -2,6 +2,7 @@ import sys
 import time
 import difflib
 import re
+import html
 from pathlib import Path
 
 
@@ -9,46 +10,60 @@ from pathlib import Path
 # SETTINGS
 # ==========================================================
 
-# Ignore first N whitespace-separated columns.
-# This affects comparison only.
 IGNORE_FIRST_COLUMNS = 5
-
-# Remove timestamps during comparison.
 REMOVE_TIMESTAMPS = True
-
-# Show SAME lines in report?
 SHOW_SAME = False
 
-# Compress consecutive identical ADDED / REMOVED lines.
-COMPRESS_REPEATS = True
+KEYWORD_FILE = "keyword.txt"
+EXCLUDE_FILE = "exclude.txt"
 
-# Compress only if repeated at least this many times.
+TEXT_REPORT = "compare_results.txt"
+HTML_REPORT = "compare_results.html"
+
+RULES_IGNORE_CASE = True
+
+COMPRESS_REPEATS = True
 MIN_REPEAT_COUNT = 3
 
-# Similarity required to consider two lines CHANGED.
 CHANGE_THRESHOLD = 0.55
-
-# Search window when pairing CHANGED lines.
 CHANGE_WINDOW = 30
-
-# Cheap length filter.
 MIN_LENGTH_RATIO = 0.60
 
-# Progress settings.
+MARK_CHANGED_DIFFERENCES = True
+DIFFERENCE_MARKER = "^"
+
 PROGRESS_BAR_WIDTH = 30
 PROGRESS_UPDATE_SECONDS = 0.15
 
 
 # ==========================================================
-# TIMESTAMP REGEX
+# NODE SETTINGS
 # ==========================================================
 
-# Matches:
-#
-# 2026-08-05 08:40:33
-# 2026-08-05 08:40:33,333
-# 2026-08-05 08:40:33.333
-#
+NODE_PATTERN = re.compile(
+    r"Node\s+name\s*:?\s*(.*)",
+    re.IGNORECASE
+)
+
+TEST_PATTERN = re.compile(
+    r"Test\s*'([^']+)'",
+    re.IGNORECASE
+)
+
+TEST_FALLBACK_PATTERN = re.compile(
+    r"Test\s*'(.+)$",
+    re.IGNORECASE
+)
+
+FLOW_NODE_TEXT = "Start flow node"
+
+ADD_TEST_TO_FLOW_NODE = True
+
+
+# ==========================================================
+# TIMESTAMP
+# ==========================================================
+
 TIMESTAMP_PATTERN = re.compile(
     r"\b"
     r"\d{4}-\d{2}-\d{2}"
@@ -60,49 +75,78 @@ TIMESTAMP_PATTERN = re.compile(
 
 
 # ==========================================================
-# FORMAT TIME
+# TIME
 # ==========================================================
 
 def format_time(seconds):
 
-    if seconds < 0:
-        seconds = 0
-
-    seconds = int(seconds)
+    seconds = max(
+        int(seconds),
+        0
+    )
 
     hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
+
+    minutes = (
+        seconds % 3600
+    ) // 60
+
     secs = seconds % 60
 
     if hours:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-    return f"{minutes:02d}:{secs:02d}"
+        return (
+            f"{hours:02d}:"
+            f"{minutes:02d}:"
+            f"{secs:02d}"
+        )
+
+    return (
+        f"{minutes:02d}:"
+        f"{secs:02d}"
+    )
 
 
 # ==========================================================
-# PROGRESS BAR
+# PROGRESS
 # ==========================================================
 
 class Progress:
 
-    def __init__(self, total, name="Processing"):
+    def __init__(
+        self,
+        total,
+        name="Processing"
+    ):
 
-        self.total = max(total, 1)
+        self.total = max(
+            total,
+            1
+        )
+
         self.name = name
 
-        self.start_time = time.perf_counter()
+        self.start_time = (
+            time.perf_counter()
+        )
+
         self.last_update = 0
 
 
-    def update(self, current, force=False):
+    def update(
+        self,
+        current,
+        force=False
+    ):
 
         current = min(
             current,
             self.total
         )
 
-        now = time.perf_counter()
+        now = (
+            time.perf_counter()
+        )
 
         if not force:
 
@@ -110,6 +154,7 @@ class Progress:
                 now - self.last_update
                 < PROGRESS_UPDATE_SECONDS
             ):
+
                 return
 
         self.last_update = now
@@ -136,39 +181,28 @@ class Progress:
             )
         )
 
-        if elapsed > 0:
-
-            speed = (
-                current / elapsed
-            )
-
-        else:
-
-            speed = 0
-
+        speed = (
+            current / elapsed
+            if elapsed > 0
+            else 0
+        )
 
         if speed > 0:
 
-            remaining = (
-                self.total - current
-            )
-
             eta = (
-                remaining / speed
-            )
+                self.total - current
+            ) / speed
 
-            eta_text = format_time(
-                eta
+            eta_text = (
+                format_time(eta)
             )
 
         else:
 
             eta_text = "--:--"
 
-
         print(
-            f"\r"
-            f"{self.name}: "
+            f"\r{self.name}: "
             f"[{bar}] "
             f"{percentage * 100:6.2f}% "
             f"| {current:,}/{self.total:,} "
@@ -191,24 +225,144 @@ class Progress:
 
 
 # ==========================================================
-# NORMALIZE LINE
+# RULE FILES
+# ==========================================================
+
+def create_rule_files():
+
+    keyword_path = Path(
+        KEYWORD_FILE
+    )
+
+    exclude_path = Path(
+        EXCLUDE_FILE
+    )
+
+
+    if not keyword_path.exists():
+
+        with open(
+            keyword_path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            file.write("Start\n")
+            file.write("Node name\n")
+            file.write("Test '\n")
+
+        print(
+            f"Created: {KEYWORD_FILE}"
+        )
+
+
+    if not exclude_path.exists():
+
+        with open(
+            exclude_path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            file.write(
+                "# Add unwanted text here\n"
+            )
+
+            file.write(
+                "# One rule per line\n"
+            )
+
+        print(
+            f"Created: {EXCLUDE_FILE}"
+        )
+
+
+def load_rules(path):
+
+    rules = []
+
+    if not Path(path).is_file():
+
+        return rules
+
+
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+        errors="ignore"
+    ) as file:
+
+        for line in file:
+
+            rule = (
+                line.strip()
+            )
+
+            if not rule:
+                continue
+
+            if rule.startswith("#"):
+                continue
+
+            rules.append(
+                rule
+            )
+
+    return rules
+
+
+def matches_rule(
+    text,
+    rules
+):
+
+    if not text:
+        return False
+
+    if RULES_IGNORE_CASE:
+
+        check_text = (
+            text.lower()
+        )
+
+        for rule in rules:
+
+            if (
+                rule.lower()
+                in check_text
+            ):
+
+                return True
+
+    else:
+
+        for rule in rules:
+
+            if rule in text:
+                return True
+
+    return False
+
+
+# ==========================================================
+# NORMALIZATION
 # ==========================================================
 
 def normalize_line(line):
 
     text = line
 
-
-    # ======================================================
-    # STEP 1
-    # Remove first N columns
-    # ======================================================
-
     if IGNORE_FIRST_COLUMNS > 0:
 
-        parts = text.split()
+        parts = (
+            text.split()
+        )
 
-        if len(parts) <= IGNORE_FIRST_COLUMNS:
+        if (
+            len(parts)
+            <= IGNORE_FIRST_COLUMNS
+        ):
 
             text = ""
 
@@ -221,40 +375,158 @@ def normalize_line(line):
             )
 
 
-    # ======================================================
-    # STEP 2
-    # Remove timestamps
-    # ======================================================
-
     if REMOVE_TIMESTAMPS:
 
-        text = TIMESTAMP_PATTERN.sub(
-            "",
-            text
+        text = (
+            TIMESTAMP_PATTERN.sub(
+                "",
+                text
+            )
         )
 
-
-    # ======================================================
-    # STEP 3
-    # Clean spaces
-    # ======================================================
 
     text = " ".join(
         text.split()
     )
+
+    return text
+
+
+# ==========================================================
+# TEST NAME
+# ==========================================================
+
+def extract_test_name(text):
+
+    if not text:
+        return None
+
+
+    match = (
+        TEST_PATTERN.search(
+            text
+        )
+    )
+
+    if match:
+
+        return (
+            match.group(1).strip()
+        )
+
+
+    match = (
+        TEST_FALLBACK_PATTERN.search(
+            text
+        )
+    )
+
+    if match:
+
+        return (
+            match.group(1).strip()
+        )
+
+
+    return None
+
+
+# ==========================================================
+# NODE NAME
+# ==========================================================
+
+def extract_node_name(text):
+
+    if not text:
+        return None
+
+
+    match = (
+        NODE_PATTERN.search(
+            text
+        )
+    )
+
+    if not match:
+        return None
+
+
+    node_name = (
+        match.group(1).strip()
+    )
+
+
+    if not node_name:
+
+        return None
+
+
+    return node_name
+
+
+def normalize_node_name(name):
+
+    if not name:
+        return ""
+
+    return (
+        " ".join(
+            name.split()
+        ).lower()
+    )
+
+
+# ==========================================================
+# FLOW NODE
+# ==========================================================
+
+def is_flow_node(text):
+
+    if not text:
+        return False
+
+    return (
+        FLOW_NODE_TEXT.lower()
+        in text.lower()
+    )
+
+
+def build_display_text(
+    text,
+    test_name
+):
+
+    if not text:
+        return text
+
+
+    if (
+        ADD_TEST_TO_FLOW_NODE
+        and
+        is_flow_node(text)
+        and
+        test_name
+    ):
+
+        return (
+            f"{text}    "
+            f"[Test: {test_name}]"
+        )
 
 
     return text
 
 
 # ==========================================================
-# READ FILE
+# READ LOG
 # ==========================================================
 
 def read_file(path):
 
-    original_lines = []
-    normalized_lines = []
+    lines = []
+
+    current_test = None
+
 
     with open(
         path,
@@ -263,31 +535,392 @@ def read_file(path):
         errors="ignore"
     ) as file:
 
-        for line in file:
+        for line_number, line in enumerate(
+            file,
+            start=1
+        ):
 
-            original = line.rstrip(
-                "\r\n"
+            original = (
+                line.rstrip(
+                    "\r\n"
+                )
             )
 
-            original_lines.append(
-                original
-            )
-
-            normalized_lines.append(
+            normalized = (
                 normalize_line(
                     original
                 )
             )
 
 
+            # Use both versions for structural detection.
+            # This prevents metadata stripping from hiding
+            # Test / Node name.
+            found_test = (
+                extract_test_name(
+                    normalized
+                )
+                or
+                extract_test_name(
+                    original
+                )
+            )
+
+
+            if found_test:
+
+                current_test = (
+                    found_test
+                )
+
+
+            node_name = (
+                extract_node_name(
+                    normalized
+                )
+                or
+                extract_node_name(
+                    original
+                )
+            )
+
+
+            lines.append({
+
+                "line":
+                    line_number,
+
+                "original":
+                    original,
+
+                "compare":
+                    normalized,
+
+                "test":
+                    current_test,
+
+                "node":
+                    node_name
+            })
+
+
+    return lines
+
+
+# ==========================================================
+# SPLIT INTO NODE BLOCKS
+# ==========================================================
+
+def split_into_node_blocks(lines):
+
+    blocks = []
+
+    current_block = None
+
+    preamble = []
+
+
+    for item in lines:
+
+        node_name = (
+            item["node"]
+        )
+
+
+        if node_name:
+
+            if current_block is not None:
+
+                blocks.append(
+                    current_block
+                )
+
+            current_block = {
+
+                "node_name":
+                    node_name,
+
+                "node_key":
+                    normalize_node_name(
+                        node_name
+                    ),
+
+                "node_line":
+                    item["line"],
+
+                "lines": [
+                    item
+                ]
+            }
+
+
+        else:
+
+            if current_block is None:
+
+                preamble.append(
+                    item
+                )
+
+            else:
+
+                current_block[
+                    "lines"
+                ].append(
+                    item
+                )
+
+
+    if current_block is not None:
+
+        blocks.append(
+            current_block
+        )
+
+
     return (
-        original_lines,
-        normalized_lines
+        preamble,
+        blocks
     )
 
 
 # ==========================================================
-# LENGTH FILTER
+# ALIGN NODE BLOCKS
+# ==========================================================
+
+def align_node_blocks(
+    blocks_a,
+    blocks_b
+):
+
+    keys_a = [
+        block["node_key"]
+        for block in blocks_a
+    ]
+
+    keys_b = [
+        block["node_key"]
+        for block in blocks_b
+    ]
+
+
+    matcher = (
+        difflib.SequenceMatcher(
+            None,
+            keys_a,
+            keys_b,
+            autojunk=False
+        )
+    )
+
+
+    aligned = []
+
+
+    for (
+        tag,
+        a_start,
+        a_end,
+        b_start,
+        b_end
+    ) in matcher.get_opcodes():
+
+
+        # ==================================================
+        # EXACTLY ALIGNED NODE SEQUENCE
+        # ==================================================
+
+        if tag == "equal":
+
+            count = (
+                a_end - a_start
+            )
+
+            for offset in range(
+                count
+            ):
+
+                aligned.append({
+
+                    "type":
+                        "MATCH",
+
+                    "a":
+                        blocks_a[
+                            a_start + offset
+                        ],
+
+                    "b":
+                        blocks_b[
+                            b_start + offset
+                        ]
+                })
+
+
+        # ==================================================
+        # NODE ONLY IN A
+        # ==================================================
+
+        elif tag == "delete":
+
+            for index in range(
+                a_start,
+                a_end
+            ):
+
+                aligned.append({
+
+                    "type":
+                        "A_ONLY",
+
+                    "a":
+                        blocks_a[
+                            index
+                        ],
+
+                    "b":
+                        None
+                })
+
+
+        # ==================================================
+        # NODE ONLY IN B
+        # ==================================================
+
+        elif tag == "insert":
+
+            for index in range(
+                b_start,
+                b_end
+            ):
+
+                aligned.append({
+
+                    "type":
+                        "B_ONLY",
+
+                    "a":
+                        None,
+
+                    "b":
+                        blocks_b[
+                            index
+                        ]
+                })
+
+
+        # ==================================================
+        # REPLACE
+        # ==================================================
+
+        elif tag == "replace":
+
+            sub_a = (
+                blocks_a[
+                    a_start:a_end
+                ]
+            )
+
+            sub_b = (
+                blocks_b[
+                    b_start:b_end
+                ]
+            )
+
+
+            # Try to find matching node names inside
+            # this replaced region.
+            used_b = set()
+
+
+            for block_a in sub_a:
+
+                found_index = None
+
+
+                for index_b, block_b in enumerate(
+                    sub_b
+                ):
+
+                    if index_b in used_b:
+                        continue
+
+
+                    if (
+                        block_a["node_key"]
+                        ==
+                        block_b["node_key"]
+                    ):
+
+                        found_index = (
+                            index_b
+                        )
+
+                        break
+
+
+                if found_index is not None:
+
+                    used_b.add(
+                        found_index
+                    )
+
+                    aligned.append({
+
+                        "type":
+                            "MATCH",
+
+                        "a":
+                            block_a,
+
+                        "b":
+                            sub_b[
+                                found_index
+                            ]
+                    })
+
+
+                else:
+
+                    aligned.append({
+
+                        "type":
+                            "A_ONLY",
+
+                        "a":
+                            block_a,
+
+                        "b":
+                            None
+                    })
+
+
+            for index_b, block_b in enumerate(
+                sub_b
+            ):
+
+                if index_b in used_b:
+                    continue
+
+
+                aligned.append({
+
+                    "type":
+                        "B_ONLY",
+
+                    "a":
+                        None,
+
+                    "b":
+                        block_b
+                })
+
+
+    return aligned
+
+
+# ==========================================================
+# LENGTH CHECK
 # ==========================================================
 
 def length_is_reasonable(
@@ -295,21 +928,30 @@ def length_is_reasonable(
     line_b
 ):
 
-    len_a = len(line_a)
-    len_b = len(line_b)
+    len_a = len(
+        line_a
+    )
+
+    len_b = len(
+        line_b
+    )
 
 
     if (
         len_a == 0
-        and len_b == 0
+        and
+        len_b == 0
     ):
+
         return True
 
 
     if (
         len_a == 0
-        or len_b == 0
+        or
+        len_b == 0
     ):
+
         return False
 
 
@@ -324,13 +966,9 @@ def length_is_reasonable(
     )
 
 
-    ratio = (
-        shorter / longer
-    )
-
-
     return (
-        ratio >= MIN_LENGTH_RATIO
+        shorter / longer
+        >= MIN_LENGTH_RATIO
     )
 
 
@@ -344,6 +982,7 @@ def similarity(
 ):
 
     if line_a == line_b:
+
         return 1.0
 
 
@@ -351,40 +990,41 @@ def similarity(
         line_a,
         line_b
     ):
+
         return 0.0
 
 
-    matcher = difflib.SequenceMatcher(
-        None,
-        line_a,
-        line_b,
-        autojunk=True
+    matcher = (
+        difflib.SequenceMatcher(
+            None,
+            line_a,
+            line_b,
+            autojunk=True
+        )
     )
 
 
-    # Cheap check first.
     if (
         matcher.quick_ratio()
         < CHANGE_THRESHOLD
     ):
+
         return 0.0
 
 
-    return matcher.ratio()
+    return (
+        matcher.ratio()
+    )
 
 
 # ==========================================================
-# CREATE RESULT
+# RESULT
 # ==========================================================
 
 def make_result(
     result_type,
-    old_line=None,
-    new_line=None,
-    old_text=None,
-    new_text=None,
-    old_compare=None,
-    new_compare=None,
+    old_item=None,
+    new_item=None,
     similarity_value=None
 ):
 
@@ -393,23 +1033,11 @@ def make_result(
         "type":
             result_type,
 
-        "old_line":
-            old_line,
+        "old":
+            old_item,
 
-        "new_line":
-            new_line,
-
-        "old_text":
-            old_text,
-
-        "new_text":
-            new_text,
-
-        "old_compare":
-            old_compare,
-
-        "new_compare":
-            new_compare,
+        "new":
+            new_item,
 
         "similarity":
             similarity_value
@@ -429,6 +1057,35 @@ def pair_changed_lines(
 
     used_added = set()
 
+
+    if not removed:
+
+        for item in added:
+
+            results.append(
+                make_result(
+                    "ADDED",
+                    new_item=item
+                )
+            )
+
+        return results
+
+
+    if not added:
+
+        for item in removed:
+
+            results.append(
+                make_result(
+                    "REMOVED",
+                    old_item=item
+                )
+            )
+
+        return results
+
+
     removed_count = len(
         removed
     )
@@ -438,62 +1095,6 @@ def pair_changed_lines(
     )
 
 
-    # ======================================================
-    # ONLY ADDED
-    # ======================================================
-
-    if removed_count == 0:
-
-        for item in added:
-
-            results.append(
-                make_result(
-                    "ADDED",
-
-                    new_line=
-                        item["line"],
-
-                    new_text=
-                        item["text"],
-
-                    new_compare=
-                        item["compare"]
-                )
-            )
-
-        return results
-
-
-    # ======================================================
-    # ONLY REMOVED
-    # ======================================================
-
-    if added_count == 0:
-
-        for item in removed:
-
-            results.append(
-                make_result(
-                    "REMOVED",
-
-                    old_line=
-                        item["line"],
-
-                    old_text=
-                        item["text"],
-
-                    old_compare=
-                        item["compare"]
-                )
-            )
-
-        return results
-
-
-    # ======================================================
-    # FIND CHANGED PAIRS
-    # ======================================================
-
     for (
         removed_index,
         old_item
@@ -501,17 +1102,10 @@ def pair_changed_lines(
         removed
     ):
 
-        old_compare = (
-            old_item["compare"]
-        )
-
         best_index = None
+
         best_score = 0.0
 
-
-        # --------------------------------------------------
-        # Estimate position
-        # --------------------------------------------------
 
         if removed_count <= 1:
 
@@ -523,8 +1117,7 @@ def pair_changed_lines(
                 removed_index
                 /
                 (
-                    removed_count
-                    - 1
+                    removed_count - 1
                 )
             )
 
@@ -538,106 +1131,70 @@ def pair_changed_lines(
             )
 
 
-        # --------------------------------------------------
-        # Candidate positions
-        # --------------------------------------------------
-
-        candidate_order = []
+        candidates = []
 
 
         for distance in range(
-            0,
             CHANGE_WINDOW + 1
         ):
 
-            if distance == 0:
-
-                candidates = [
-                    estimated_index
+            positions = (
+                [estimated_index]
+                if distance == 0
+                else [
+                    estimated_index - distance,
+                    estimated_index + distance
                 ]
-
-            else:
-
-                candidates = [
-
-                    estimated_index
-                    - distance,
-
-                    estimated_index
-                    + distance
-                ]
+            )
 
 
-            for candidate in candidates:
+            for candidate in positions:
 
                 if (
-                    0
-                    <= candidate
-                    < added_count
+                    0 <= candidate < added_count
+                    and
+                    candidate not in candidates
                 ):
 
-                    if (
+                    candidates.append(
                         candidate
-                        not in candidate_order
-                    ):
-
-                        candidate_order.append(
-                            candidate
-                        )
+                    )
 
 
-        # --------------------------------------------------
-        # Compare candidates
-        # --------------------------------------------------
+        for candidate in candidates:
 
-        for index in candidate_order:
-
-            if index in used_added:
+            if candidate in used_added:
                 continue
 
 
             new_item = (
-                added[index]
+                added[candidate]
             )
-
-            new_compare = (
-                new_item["compare"]
-            )
-
-
-            if not length_is_reasonable(
-                old_compare,
-                new_compare
-            ):
-                continue
 
 
             score = similarity(
-                old_compare,
-                new_compare
+                old_item["compare"],
+                new_item["compare"]
             )
 
 
             if score > best_score:
 
                 best_score = score
-                best_index = index
+
+                best_index = (
+                    candidate
+                )
 
 
-            # Very strong match.
             if best_score >= 0.98:
                 break
 
 
-        # ==================================================
-        # CHANGED
-        # ==================================================
-
         if (
             best_index is not None
             and
-            best_score
-            >= CHANGE_THRESHOLD
+            best_score >= CHANGE_THRESHOLD
         ):
 
             new_item = (
@@ -645,7 +1202,6 @@ def pair_changed_lines(
                     best_index
                 ]
             )
-
 
             used_added.add(
                 best_index
@@ -655,138 +1211,71 @@ def pair_changed_lines(
             results.append(
                 make_result(
                     "CHANGED",
-
-                    old_line=
-                        old_item["line"],
-
-                    new_line=
-                        new_item["line"],
-
-                    old_text=
-                        old_item["text"],
-
-                    new_text=
-                        new_item["text"],
-
-                    old_compare=
-                        old_item["compare"],
-
-                    new_compare=
-                        new_item["compare"],
-
-                    similarity_value=
-                        best_score
+                    old_item,
+                    new_item,
+                    best_score
                 )
             )
 
-
-        # ==================================================
-        # REMOVED
-        # ==================================================
 
         else:
 
             results.append(
                 make_result(
                     "REMOVED",
-
-                    old_line=
-                        old_item["line"],
-
-                    old_text=
-                        old_item["text"],
-
-                    old_compare=
-                        old_item["compare"]
+                    old_item=old_item
                 )
             )
 
 
-    # ======================================================
-    # REMAINING ADDED
-    # ======================================================
-
-    for (
-        index,
-        new_item
-    ) in enumerate(
+    for index, item in enumerate(
         added
     ):
 
-        if index in used_added:
-            continue
+        if index not in used_added:
 
-
-        results.append(
-            make_result(
-                "ADDED",
-
-                new_line=
-                    new_item["line"],
-
-                new_text=
-                    new_item["text"],
-
-                new_compare=
-                    new_item["compare"]
+            results.append(
+                make_result(
+                    "ADDED",
+                    new_item=item
+                )
             )
-        )
 
 
     return results
 
 
 # ==========================================================
-# COMPARE FILES
+# COMPARE LINE LISTS
 # ==========================================================
 
-def compare_files(
-    original_a,
-    normalized_a,
-    original_b,
-    normalized_b
+def compare_line_lists(
+    lines_a,
+    lines_b
 ):
 
-    print()
-    print(
-        "Building line comparison map..."
-    )
+    compare_a = [
+        item["compare"]
+        for item in lines_a
+    ]
+
+    compare_b = [
+        item["compare"]
+        for item in lines_b
+    ]
 
 
-    matcher = difflib.SequenceMatcher(
-        None,
-        normalized_a,
-        normalized_b,
-        autojunk=True
-    )
-
-
-    opcodes = (
-        matcher.get_opcodes()
-    )
-
-
-    print(
-        f"Comparison blocks: "
-        f"{len(opcodes):,}"
-    )
-
-
-    total_lines = max(
-        len(normalized_a),
-        len(normalized_b)
-    )
-
-
-    progress = Progress(
-        total_lines,
-        "Analyzing"
+    matcher = (
+        difflib.SequenceMatcher(
+            None,
+            compare_a,
+            compare_b,
+            autojunk=True
+        )
     )
 
 
     results = []
-
-    processed = 0
 
 
     for (
@@ -795,18 +1284,13 @@ def compare_files(
         a_end,
         b_start,
         b_end
-    ) in opcodes:
+    ) in matcher.get_opcodes():
 
-
-        # ==================================================
-        # SAME
-        # ==================================================
 
         if tag == "equal":
 
             count = (
-                a_end
-                - a_start
+                a_end - a_start
             )
 
 
@@ -814,56 +1298,22 @@ def compare_files(
                 count
             ):
 
-                old_index = (
-                    a_start
-                    + offset
-                )
-
-                new_index = (
-                    b_start
-                    + offset
-                )
-
-
                 results.append(
                     make_result(
                         "SAME",
 
-                        old_line=
-                            old_index + 1,
+                        lines_a[
+                            a_start + offset
+                        ],
 
-                        new_line=
-                            new_index + 1,
+                        lines_b[
+                            b_start + offset
+                        ],
 
-                        old_text=
-                            original_a[
-                                old_index
-                            ],
-
-                        new_text=
-                            original_b[
-                                new_index
-                            ],
-
-                        old_compare=
-                            normalized_a[
-                                old_index
-                            ],
-
-                        new_compare=
-                            normalized_b[
-                                new_index
-                            ],
-
-                        similarity_value=
-                            1.0
+                        1.0
                     )
                 )
 
-
-        # ==================================================
-        # REMOVED
-        # ==================================================
 
         elif tag == "delete":
 
@@ -875,26 +1325,11 @@ def compare_files(
                 results.append(
                     make_result(
                         "REMOVED",
-
-                        old_line=
-                            index + 1,
-
-                        old_text=
-                            original_a[
-                                index
-                            ],
-
-                        old_compare=
-                            normalized_a[
-                                index
-                            ]
+                        old_item=
+                            lines_a[index]
                     )
                 )
 
-
-        # ==================================================
-        # ADDED
-        # ==================================================
 
         elif tag == "insert":
 
@@ -906,700 +1341,1595 @@ def compare_files(
                 results.append(
                     make_result(
                         "ADDED",
-
-                        new_line=
-                            index + 1,
-
-                        new_text=
-                            original_b[
-                                index
-                            ],
-
-                        new_compare=
-                            normalized_b[
-                                index
-                            ]
+                        new_item=
+                            lines_b[index]
                     )
                 )
 
 
-        # ==================================================
-        # REPLACE
-        # ==================================================
-
         elif tag == "replace":
 
-            removed = []
-
-            added = []
-
-
-            for index in range(
-                a_start,
-                a_end
-            ):
-
-                removed.append({
-
-                    "line":
-                        index + 1,
-
-                    "text":
-                        original_a[
-                            index
-                        ],
-
-                    "compare":
-                        normalized_a[
-                            index
-                        ]
-                })
-
-
-            for index in range(
-                b_start,
-                b_end
-            ):
-
-                added.append({
-
-                    "line":
-                        index + 1,
-
-                    "text":
-                        original_b[
-                            index
-                        ],
-
-                    "compare":
-                        normalized_b[
-                            index
-                        ]
-                })
-
-
-            block_results = (
+            results.extend(
                 pair_changed_lines(
-                    removed,
-                    added
+
+                    lines_a[
+                        a_start:a_end
+                    ],
+
+                    lines_b[
+                        b_start:b_end
+                    ]
                 )
             )
 
-
-            results.extend(
-                block_results
-            )
-
-
-        processed = max(
-            processed,
-            a_end,
-            b_end
-        )
-
-
-        progress.update(
-            processed
-        )
-
-
-    progress.finish()
 
     return results
 
 
 # ==========================================================
-# CAN COMPRESS?
+# KEYWORD / EXCLUDE
 # ==========================================================
 
-def can_compress(
-    previous,
-    current
-):
+def result_texts(item):
 
-    if previous["type"] not in (
-        "ADDED",
-        "REMOVED"
-    ):
-        return False
+    texts = []
 
 
-    if (
-        current["type"]
-        != previous["type"]
-    ):
-        return False
+    if item.get("old"):
 
+        texts.append(
+            item["old"]["compare"]
+        )
 
-    # ======================================================
-    # REMOVED
-    # ======================================================
-
-    if current["type"] == "REMOVED":
-
-        if (
-            current["old_compare"]
-            != previous["old_compare"]
-        ):
-            return False
-
-
-        if (
-            current["old_line"]
-            != previous["old_line"] + 1
-        ):
-            return False
-
-
-    # ======================================================
-    # ADDED
-    # ======================================================
-
-    elif current["type"] == "ADDED":
-
-        if (
-            current["new_compare"]
-            != previous["new_compare"]
-        ):
-            return False
-
-
-        if (
-            current["new_line"]
-            != previous["new_line"] + 1
-        ):
-            return False
-
-
-    return True
-
-
-# ==========================================================
-# COMPRESS RESULTS
-# ==========================================================
-
-def compress_results(
-    results
-):
-
-    if not COMPRESS_REPEATS:
-        return results
-
-
-    compressed = []
-
-    index = 0
-
-
-    while index < len(results):
-
-        current = (
-            results[index]
+        texts.append(
+            item["old"]["original"]
         )
 
 
-        # SAME / CHANGED are not compressed here.
-        if current["type"] not in (
-            "ADDED",
-            "REMOVED"
+    if item.get("new"):
+
+        texts.append(
+            item["new"]["compare"]
+        )
+
+        texts.append(
+            item["new"]["original"]
+        )
+
+
+    return texts
+
+
+def result_matches_rules(
+    item,
+    rules
+):
+
+    for text in result_texts(
+        item
+    ):
+
+        if matches_rule(
+            text,
+            rules
         ):
 
-            compressed.append(
-                current
-            )
+            return True
 
-            index += 1
+
+    return False
+
+
+def filter_results(
+    results,
+    exclude_rules
+):
+
+    filtered = []
+
+
+    for item in results:
+
+        if result_matches_rules(
+            item,
+            exclude_rules
+        ):
+
             continue
 
 
-        group = [
-            current
-        ]
-
-
-        next_index = (
-            index + 1
+        filtered.append(
+            item
         )
 
 
-        while (
-            next_index
-            < len(results)
+    return filtered
+
+
+# ==========================================================
+# DIFFERENCE MARKERS TXT
+# ==========================================================
+
+def create_difference_markers(
+    old_text,
+    new_text
+):
+
+    old_marker = [
+        " "
+    ] * len(old_text)
+
+    new_marker = [
+        " "
+    ] * len(new_text)
+
+
+    matcher = (
+        difflib.SequenceMatcher(
+            None,
+            old_text,
+            new_text,
+            autojunk=False
+        )
+    )
+
+
+    for (
+        tag,
+        old_start,
+        old_end,
+        new_start,
+        new_end
+    ) in matcher.get_opcodes():
+
+
+        if tag == "equal":
+            continue
+
+
+        if tag in (
+            "replace",
+            "delete"
         ):
 
-            previous = (
-                group[-1]
-            )
-
-            candidate = (
-                results[
-                    next_index
-                ]
-            )
-
-
-            if not can_compress(
-                previous,
-                candidate
+            for index in range(
+                old_start,
+                old_end
             ):
-                break
+
+                old_marker[index] = (
+                    DIFFERENCE_MARKER
+                )
 
 
-            group.append(
-                candidate
-            )
-
-
-            next_index += 1
-
-
-        # ==================================================
-        # CREATE GROUP
-        # ==================================================
-
-        if (
-            len(group)
-            >= MIN_REPEAT_COUNT
+        if tag in (
+            "replace",
+            "insert"
         ):
 
-            first = group[0]
-            last = group[-1]
-
-
-            # ==============================================
-            # REMOVED GROUP
-            # ==============================================
-
-            if (
-                current["type"]
-                == "REMOVED"
+            for index in range(
+                new_start,
+                new_end
             ):
 
-                compressed.append({
-
-                    "type":
-                        "REMOVED_GROUP",
-
-                    "count":
-                        len(group),
-
-                    "start_line":
-                        first[
-                            "old_line"
-                        ],
-
-                    "end_line":
-                        last[
-                            "old_line"
-                        ],
-
-                    "compare":
-                        first[
-                            "old_compare"
-                        ]
-                })
+                new_marker[index] = (
+                    DIFFERENCE_MARKER
+                )
 
 
-            # ==============================================
-            # ADDED GROUP
-            # ==============================================
+    return (
+        "".join(
+            old_marker
+        ).rstrip(),
 
-            else:
+        "".join(
+            new_marker
+        ).rstrip()
+    )
 
-                compressed.append({
 
-                    "type":
-                        "ADDED_GROUP",
+# ==========================================================
+# HTML CHARACTER DIFF
+# ==========================================================
 
-                    "count":
-                        len(group),
+def html_diff(
+    old_text,
+    new_text
+):
 
-                    "start_line":
-                        first[
-                            "new_line"
-                        ],
+    matcher = (
+        difflib.SequenceMatcher(
+            None,
+            old_text,
+            new_text,
+            autojunk=False
+        )
+    )
 
-                    "end_line":
-                        last[
-                            "new_line"
-                        ],
 
-                    "compare":
-                        first[
-                            "new_compare"
-                        ]
-                })
+    old_parts = []
+
+    new_parts = []
+
+
+    for (
+        tag,
+        old_start,
+        old_end,
+        new_start,
+        new_end
+    ) in matcher.get_opcodes():
+
+
+        old_part = (
+            old_text[
+                old_start:old_end
+            ]
+        )
+
+        new_part = (
+            new_text[
+                new_start:new_end
+            ]
+        )
+
+
+        if tag == "equal":
+
+            old_parts.append(
+                html.escape(
+                    old_part
+                )
+            )
+
+            new_parts.append(
+                html.escape(
+                    new_part
+                )
+            )
+
+
+        else:
+
+            if old_part:
+
+                old_parts.append(
+                    '<span class="difference">'
+                    +
+                    html.escape(
+                        old_part
+                    )
+                    +
+                    '</span>'
+                )
+
+
+            if new_part:
+
+                new_parts.append(
+                    '<span class="difference">'
+                    +
+                    html.escape(
+                        new_part
+                    )
+                    +
+                    '</span>'
+                )
+
+
+    return (
+        "".join(old_parts),
+        "".join(new_parts)
+    )
+
+
+# ==========================================================
+# NODE LABEL
+# ==========================================================
+
+def node_title(
+    aligned_item
+):
+
+    block_a = (
+        aligned_item["a"]
+    )
+
+    block_b = (
+        aligned_item["b"]
+    )
+
+
+    if block_a:
+
+        return (
+            block_a["node_name"]
+        )
+
+
+    if block_b:
+
+        return (
+            block_b["node_name"]
+        )
+
+
+    return "UNKNOWN"
+
+
+# ==========================================================
+# BUILD ALL COMPARISONS
+# ==========================================================
+
+def build_comparisons(
+    preamble_a,
+    blocks_a,
+    preamble_b,
+    blocks_b,
+    exclude_rules
+):
+
+    comparisons = []
+
+
+    # ======================================================
+    # PREAMBLE
+    # ======================================================
+
+    if (
+        preamble_a
+        or preamble_b
+    ):
+
+        preamble_results = (
+            compare_line_lists(
+                preamble_a,
+                preamble_b
+            )
+        )
+
+        preamble_results = (
+            filter_results(
+                preamble_results,
+                exclude_rules
+            )
+        )
+
+
+        comparisons.append({
+
+            "kind":
+                "PREAMBLE",
+
+            "node":
+                "BEFORE FIRST NODE",
+
+            "a":
+                None,
+
+            "b":
+                None,
+
+            "results":
+                preamble_results
+        })
+
+
+    # ======================================================
+    # ALIGN NODES
+    # ======================================================
+
+    aligned = (
+        align_node_blocks(
+            blocks_a,
+            blocks_b
+        )
+    )
+
+
+    for item in aligned:
+
+        kind = (
+            item["type"]
+        )
+
+        block_a = (
+            item["a"]
+        )
+
+        block_b = (
+            item["b"]
+        )
 
 
         # ==================================================
-        # KEEP INDIVIDUAL
+        # MATCHED NODE
+        # ==================================================
+
+        if kind == "MATCH":
+
+            results = (
+                compare_line_lists(
+                    block_a["lines"],
+                    block_b["lines"]
+                )
+            )
+
+
+        # ==================================================
+        # ONLY A
+        # ==================================================
+
+        elif kind == "A_ONLY":
+
+            results = [
+
+                make_result(
+                    "REMOVED",
+                    old_item=line
+                )
+
+                for line in (
+                    block_a["lines"]
+                )
+            ]
+
+
+        # ==================================================
+        # ONLY B
         # ==================================================
 
         else:
 
-            compressed.extend(
-                group
+            results = [
+
+                make_result(
+                    "ADDED",
+                    new_item=line
+                )
+
+                for line in (
+                    block_b["lines"]
+                )
+            ]
+
+
+        results = (
+            filter_results(
+                results,
+                exclude_rules
             )
+        )
 
 
-        index = next_index
+        comparisons.append({
+
+            "kind":
+                kind,
+
+            "node":
+                node_title(
+                    item
+                ),
+
+            "a":
+                block_a,
+
+            "b":
+                block_b,
+
+            "results":
+                results
+        })
 
 
-    return compressed
+    return comparisons
 
 
 # ==========================================================
-# WRITE REPORT
+# SHOULD DISPLAY
 # ==========================================================
 
-def write_report(
-    results,
-    file_a,
-    file_b,
-    output_file
+def should_display(
+    result,
+    keyword_rules
 ):
 
-    name_a = Path(
-        file_a
-    ).name
+    if result["type"] != "SAME":
 
-    name_b = Path(
-        file_b
-    ).name
+        return True
 
 
-    changed_count = 0
-    added_count = 0
-    removed_count = 0
+    if SHOW_SAME:
 
-    added_groups = 0
-    removed_groups = 0
+        return True
 
 
-    actual_same = sum(
-        1
-        for item in results
-        if item["type"] == "SAME"
-    )
-
-
-    print()
-    print(
-        "Compressing repeated events..."
-    )
-
-
-    report_results = (
-        compress_results(
-            results
+    return (
+        result_matches_rules(
+            result,
+            keyword_rules
         )
     )
 
 
-    print(
-        f"Raw results:    "
-        f"{len(results):,}"
+# ==========================================================
+# TXT REPORT
+# ==========================================================
+
+def write_text_report(
+    comparisons,
+    file_a,
+    file_b,
+    keyword_rules
+):
+
+    name_a = (
+        Path(file_a).name
     )
 
-    print(
-        f"Report records: "
-        f"{len(report_results):,}"
-    )
-
-
-    print()
-    print(
-        "Writing report..."
-    )
-
-
-    progress = Progress(
-        len(report_results),
-        "Writing"
+    name_b = (
+        Path(file_b).name
     )
 
 
     with open(
-        output_file,
+        TEXT_REPORT,
         "w",
         encoding="utf-8"
     ) as output:
 
 
-        for (
-            index,
-            item
-        ) in enumerate(
-            report_results,
-            start=1
-        ):
+        for comparison in comparisons:
 
-            item_type = (
-                item["type"]
+            node = (
+                comparison["node"]
+            )
+
+            kind = (
+                comparison["kind"]
             )
 
 
-            # ==============================================
-            # SAME
-            # ==============================================
+            output.write(
+                "\n"
+                +
+                "=" * 100
+                +
+                "\n"
+            )
 
-            if item_type == "SAME":
 
-                if SHOW_SAME:
+            if kind == "MATCH":
+
+                output.write(
+                    f"NODE: {node}\n"
+                )
+
+
+            elif kind == "A_ONLY":
+
+                output.write(
+                    f"NODE ONLY IN "
+                    f"{name_a}: "
+                    f"{node}\n"
+                )
+
+
+            elif kind == "B_ONLY":
+
+                output.write(
+                    f"NODE ONLY IN "
+                    f"{name_b}: "
+                    f"{node}\n"
+                )
+
+
+            else:
+
+                output.write(
+                    f"{node}\n"
+                )
+
+
+            output.write(
+                "=" * 100
+                +
+                "\n\n"
+            )
+
+
+            for result in (
+                comparison["results"]
+            ):
+
+
+                if not should_display(
+                    result,
+                    keyword_rules
+                ):
+
+                    continue
+
+
+                result_type = (
+                    result["type"]
+                )
+
+
+                # ==========================================
+                # SAME
+                # ==========================================
+
+                if result_type == "SAME":
+
+                    old = (
+                        result["old"]
+                    )
+
+                    new = (
+                        result["new"]
+                    )
+
+
+                    display_old = (
+                        build_display_text(
+                            old["compare"],
+                            old["test"]
+                        )
+                    )
+
+                    display_new = (
+                        build_display_text(
+                            new["compare"],
+                            new["test"]
+                        )
+                    )
+
 
                     output.write(
+                        "[KEYWORD]\n"
+                        if not SHOW_SAME
+                        else
                         "[SAME]\n"
                     )
 
-                    output.write(
-                        f"  "
-                        f"{item['old_compare']}    "
-                        f"[{name_a}:"
-                        f"{item['old_line']} "
-                        f"| "
-                        f"{name_b}:"
-                        f"{item['new_line']}]\n\n"
+
+                    if (
+                        display_old
+                        == display_new
+                    ):
+
+                        output.write(
+                            f"{name_a}:{old['line']} "
+                            f"| "
+                            f"{name_b}:{new['line']} "
+                            f"{display_old}\n\n"
+                        )
+
+                    else:
+
+                        output.write(
+                            f"{name_a}:{old['line']} "
+                            f"{display_old}\n"
+                        )
+
+                        output.write(
+                            f"{name_b}:{new['line']} "
+                            f"{display_new}\n\n"
+                        )
+
+
+                # ==========================================
+                # CHANGED
+                # ==========================================
+
+                elif (
+                    result_type
+                    == "CHANGED"
+                ):
+
+                    old = (
+                        result["old"]
+                    )
+
+                    new = (
+                        result["new"]
                     )
 
 
-            # ==============================================
-            # CHANGED
-            # ==============================================
+                    old_text = (
+                        build_display_text(
+                            old["compare"],
+                            old["test"]
+                        )
+                    )
 
-            elif item_type == "CHANGED":
-
-                changed_count += 1
-
-
-                percent = (
-                    item["similarity"]
-                    * 100
-                )
-
-
-                output.write(
-                    f"[CHANGED] "
-                    f"Similarity: "
-                    f"{percent:.1f}%\n"
-                )
+                    new_text = (
+                        build_display_text(
+                            new["compare"],
+                            new["test"]
+                        )
+                    )
 
 
-                output.write(
-                    f"< "
-                    f"{item['old_compare']}    "
-                    f"[{name_a}:"
-                    f"{item['old_line']}]\n"
-                )
+                    output.write(
+                        f"[CHANGED] "
+                        f"Similarity: "
+                        f"{result['similarity'] * 100:.1f}%\n"
+                    )
 
 
-                output.write(
-                    f"> "
-                    f"{item['new_compare']}    "
-                    f"[{name_b}:"
-                    f"{item['new_line']}]\n\n"
-                )
+                    old_prefix = (
+                        f"{name_a}:"
+                        f"{old['line']} < "
+                    )
+
+                    new_prefix = (
+                        f"{name_b}:"
+                        f"{new['line']} > "
+                    )
 
 
-            # ==============================================
-            # REMOVED
-            # ==============================================
-
-            elif item_type == "REMOVED":
-
-                removed_count += 1
-
-
-                output.write(
-                    "[REMOVED]\n"
-                )
+                    output.write(
+                        old_prefix
+                        +
+                        old_text
+                        +
+                        "\n"
+                    )
 
 
-                output.write(
-                    f"< "
-                    f"{item['old_compare']}    "
-                    f"[{name_a}:"
-                    f"{item['old_line']}]\n\n"
-                )
+                    if MARK_CHANGED_DIFFERENCES:
+
+                        (
+                            old_marker,
+                            new_marker
+                        ) = (
+                            create_difference_markers(
+                                old_text,
+                                new_text
+                            )
+                        )
 
 
-            # ==============================================
-            # ADDED
-            # ==============================================
+                        if old_marker:
 
-            elif item_type == "ADDED":
-
-                added_count += 1
-
-
-                output.write(
-                    "[ADDED]\n"
-                )
-
-
-                output.write(
-                    f"> "
-                    f"{item['new_compare']}    "
-                    f"[{name_b}:"
-                    f"{item['new_line']}]\n\n"
-                )
+                            output.write(
+                                " " * len(
+                                    old_prefix
+                                )
+                                +
+                                old_marker
+                                +
+                                "\n"
+                            )
 
 
-            # ==============================================
-            # REMOVED GROUP
-            # ==============================================
-
-            elif (
-                item_type
-                == "REMOVED_GROUP"
-            ):
-
-                removed_count += (
-                    item["count"]
-                )
-
-                removed_groups += 1
+                    output.write(
+                        new_prefix
+                        +
+                        new_text
+                        +
+                        "\n"
+                    )
 
 
-                output.write(
-                    f"[REMOVED ×"
-                    f"{item['count']}]\n"
-                )
+                    if (
+                        MARK_CHANGED_DIFFERENCES
+                        and
+                        new_marker
+                    ):
+
+                        output.write(
+                            " " * len(
+                                new_prefix
+                            )
+                            +
+                            new_marker
+                            +
+                            "\n"
+                        )
 
 
-                output.write(
-                    f"< "
-                    f"{item['compare']}    "
-                    f"[{name_a}:"
-                    f"{item['start_line']}"
-                    f"-"
-                    f"{item['end_line']}]\n\n"
-                )
+                    output.write(
+                        "\n"
+                    )
 
 
-            # ==============================================
-            # ADDED GROUP
-            # ==============================================
+                # ==========================================
+                # REMOVED
+                # ==========================================
 
-            elif (
-                item_type
-                == "ADDED_GROUP"
-            ):
+                elif (
+                    result_type
+                    == "REMOVED"
+                ):
 
-                added_count += (
-                    item["count"]
-                )
-
-                added_groups += 1
+                    old = (
+                        result["old"]
+                    )
 
 
-                output.write(
-                    f"[ADDED ×"
-                    f"{item['count']}]\n"
-                )
+                    text = (
+                        build_display_text(
+                            old["compare"],
+                            old["test"]
+                        )
+                    )
 
 
-                output.write(
-                    f"> "
-                    f"{item['compare']}    "
-                    f"[{name_b}:"
-                    f"{item['start_line']}"
-                    f"-"
-                    f"{item['end_line']}]\n\n"
-                )
+                    output.write(
+                        "[REMOVED]\n"
+                    )
+
+                    output.write(
+                        f"{name_a}:"
+                        f"{old['line']} < "
+                        f"{text}\n\n"
+                    )
 
 
-            progress.update(
-                index
+                # ==========================================
+                # ADDED
+                # ==========================================
+
+                elif (
+                    result_type
+                    == "ADDED"
+                ):
+
+                    new = (
+                        result["new"]
+                    )
+
+
+                    text = (
+                        build_display_text(
+                            new["compare"],
+                            new["test"]
+                        )
+                    )
+
+
+                    output.write(
+                        "[ADDED]\n"
+                    )
+
+                    output.write(
+                        f"{name_b}:"
+                        f"{new['line']} > "
+                        f"{text}\n\n"
+                    )
+
+
+# ==========================================================
+# HTML HEADER
+# ==========================================================
+
+def html_header(
+    name_a,
+    name_b
+):
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Log Comparison</title>
+
+<style>
+
+body {{
+    font-family:
+        Consolas,
+        "Courier New",
+        monospace;
+
+    background: #111827;
+    color: #e5e7eb;
+
+    margin: 0;
+    padding: 25px;
+}}
+
+h1 {{
+    color: #ffffff;
+}}
+
+.summary {{
+    background: #1f2937;
+    border: 1px solid #374151;
+    border-radius: 8px;
+
+    padding: 15px;
+    margin-bottom: 25px;
+}}
+
+.file-a {{
+    color: #38bdf8;
+    font-weight: bold;
+}}
+
+.file-b {{
+    color: #c084fc;
+    font-weight: bold;
+}}
+
+.node {{
+    margin-top: 28px;
+
+    background: #1f2937;
+
+    border-left:
+        6px solid #f59e0b;
+
+    padding: 12px;
+
+    font-size: 18px;
+    font-weight: bold;
+}}
+
+.node-missing {{
+    border-left:
+        6px solid #ef4444;
+}}
+
+.row {{
+    white-space: pre-wrap;
+    word-break: break-word;
+
+    padding: 5px 8px;
+
+    border-bottom:
+        1px solid #1f2937;
+}}
+
+.changed {{
+    background: #292524;
+}}
+
+.added {{
+    background: #052e16;
+}}
+
+.removed {{
+    background: #450a0a;
+}}
+
+.keyword {{
+    background: #172554;
+}}
+
+.difference {{
+    background: #dc2626;
+    color: #ffffff;
+
+    font-weight: bold;
+
+    padding: 1px 2px;
+
+    border-radius: 2px;
+}}
+
+.label {{
+    color: #9ca3af;
+    font-weight: bold;
+}}
+
+.similarity {{
+    color: #fbbf24;
+}}
+
+.line-number {{
+    color: #94a3b8;
+}}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>Log Comparison</h1>
+
+<div class="summary">
+
+File A:
+<span class="file-a">
+{html.escape(name_a)}
+</span>
+
+<br>
+
+File B:
+<span class="file-b">
+{html.escape(name_b)}
+</span>
+
+</div>
+"""
+
+
+# ==========================================================
+# HTML REPORT
+# ==========================================================
+
+def write_html_report(
+    comparisons,
+    file_a,
+    file_b,
+    keyword_rules
+):
+
+    name_a = (
+        Path(file_a).name
+    )
+
+    name_b = (
+        Path(file_b).name
+    )
+
+
+    with open(
+        HTML_REPORT,
+        "w",
+        encoding="utf-8"
+    ) as output:
+
+
+        output.write(
+            html_header(
+                name_a,
+                name_b
+            )
+        )
+
+
+        for comparison in comparisons:
+
+            node = (
+                comparison["node"]
+            )
+
+            kind = (
+                comparison["kind"]
             )
 
 
-        # ==================================================
-        # SUMMARY
-        # ==================================================
+            if kind == "MATCH":
 
-        output.write(
-            "=" * 80
-            + "\n"
-        )
+                title = (
+                    f"NODE: {node}"
+                )
 
-        output.write(
-            "SUMMARY\n"
-        )
-
-        output.write(
-            "=" * 80
-            + "\n"
-        )
+                node_class = (
+                    "node"
+                )
 
 
-        output.write(
-            f"SAME:             "
-            f"{actual_same:,}"
-        )
+            elif kind == "A_ONLY":
+
+                title = (
+                    f"NODE ONLY IN "
+                    f"{name_a}: "
+                    f"{node}"
+                )
+
+                node_class = (
+                    "node node-missing"
+                )
 
 
-        if not SHOW_SAME:
+            elif kind == "B_ONLY":
+
+                title = (
+                    f"NODE ONLY IN "
+                    f"{name_b}: "
+                    f"{node}"
+                )
+
+                node_class = (
+                    "node node-missing"
+                )
+
+
+            else:
+
+                title = node
+
+                node_class = (
+                    "node"
+                )
+
 
             output.write(
-                " (hidden)"
+                f'<div class="{node_class}">'
+                f'{html.escape(title)}'
+                f'</div>\n'
             )
 
 
-        output.write(
-            "\n"
-        )
+            for result in (
+                comparison["results"]
+            ):
+
+
+                if not should_display(
+                    result,
+                    keyword_rules
+                ):
+
+                    continue
+
+
+                result_type = (
+                    result["type"]
+                )
+
+
+                # ==========================================
+                # SAME / KEYWORD
+                # ==========================================
+
+                if result_type == "SAME":
+
+                    old = (
+                        result["old"]
+                    )
+
+                    new = (
+                        result["new"]
+                    )
+
+
+                    text = (
+                        build_display_text(
+                            old["compare"],
+                            old["test"]
+                        )
+                    )
+
+
+                    output.write(
+                        '<div class="row keyword">'
+                    )
+
+                    output.write(
+                        '<span class="label">'
+                        '[KEYWORD] '
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="file-a">'
+                        +
+                        html.escape(
+                            name_a
+                        )
+                        +
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="line-number">'
+                        f':{old["line"]}'
+                        '</span>'
+                    )
+
+                    output.write(
+                        ' | '
+                    )
+
+                    output.write(
+                        '<span class="file-b">'
+                        +
+                        html.escape(
+                            name_b
+                        )
+                        +
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="line-number">'
+                        f':{new["line"]}'
+                        '</span> '
+                    )
+
+                    output.write(
+                        html.escape(
+                            text
+                        )
+                    )
+
+                    output.write(
+                        '</div>\n'
+                    )
+
+
+                # ==========================================
+                # CHANGED
+                # ==========================================
+
+                elif (
+                    result_type
+                    == "CHANGED"
+                ):
+
+                    old = (
+                        result["old"]
+                    )
+
+                    new = (
+                        result["new"]
+                    )
+
+
+                    old_text = (
+                        build_display_text(
+                            old["compare"],
+                            old["test"]
+                        )
+                    )
+
+                    new_text = (
+                        build_display_text(
+                            new["compare"],
+                            new["test"]
+                        )
+                    )
+
+
+                    (
+                        old_html,
+                        new_html
+                    ) = (
+                        html_diff(
+                            old_text,
+                            new_text
+                        )
+                    )
+
+
+                    output.write(
+                        '<div class="row changed">'
+                    )
+
+                    output.write(
+                        '<span class="label">'
+                        '[CHANGED] '
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="similarity">'
+                        f'{result["similarity"] * 100:.1f}%'
+                        '</span>'
+                    )
+
+                    output.write(
+                        '</div>\n'
+                    )
+
+
+                    output.write(
+                        '<div class="row changed">'
+                    )
+
+                    output.write(
+                        '<span class="file-a">'
+                        +
+                        html.escape(
+                            name_a
+                        )
+                        +
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="line-number">'
+                        f':{old["line"]}'
+                        '</span> '
+                    )
+
+                    output.write(
+                        '&lt; '
+                    )
+
+                    output.write(
+                        old_html
+                    )
+
+                    output.write(
+                        '</div>\n'
+                    )
+
+
+                    output.write(
+                        '<div class="row changed">'
+                    )
+
+                    output.write(
+                        '<span class="file-b">'
+                        +
+                        html.escape(
+                            name_b
+                        )
+                        +
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="line-number">'
+                        f':{new["line"]}'
+                        '</span> '
+                    )
+
+                    output.write(
+                        '&gt; '
+                    )
+
+                    output.write(
+                        new_html
+                    )
+
+                    output.write(
+                        '</div>\n'
+                    )
+
+
+                # ==========================================
+                # REMOVED
+                # ==========================================
+
+                elif (
+                    result_type
+                    == "REMOVED"
+                ):
+
+                    old = (
+                        result["old"]
+                    )
+
+
+                    text = (
+                        build_display_text(
+                            old["compare"],
+                            old["test"]
+                        )
+                    )
+
+
+                    output.write(
+                        '<div class="row removed">'
+                    )
+
+                    output.write(
+                        '<span class="label">'
+                        '[REMOVED] '
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="file-a">'
+                        +
+                        html.escape(
+                            name_a
+                        )
+                        +
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="line-number">'
+                        f':{old["line"]}'
+                        '</span> '
+                    )
+
+                    output.write(
+                        html.escape(
+                            text
+                        )
+                    )
+
+                    output.write(
+                        '</div>\n'
+                    )
+
+
+                # ==========================================
+                # ADDED
+                # ==========================================
+
+                elif (
+                    result_type
+                    == "ADDED"
+                ):
+
+                    new = (
+                        result["new"]
+                    )
+
+
+                    text = (
+                        build_display_text(
+                            new["compare"],
+                            new["test"]
+                        )
+                    )
+
+
+                    output.write(
+                        '<div class="row added">'
+                    )
+
+                    output.write(
+                        '<span class="label">'
+                        '[ADDED] '
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="file-b">'
+                        +
+                        html.escape(
+                            name_b
+                        )
+                        +
+                        '</span>'
+                    )
+
+                    output.write(
+                        '<span class="line-number">'
+                        f':{new["line"]}'
+                        '</span> '
+                    )
+
+                    output.write(
+                        html.escape(
+                            text
+                        )
+                    )
+
+                    output.write(
+                        '</div>\n'
+                    )
 
 
         output.write(
-            f"CHANGED:          "
-            f"{changed_count:,}\n"
+            """
+</body>
+</html>
+"""
         )
 
 
-        output.write(
-            f"ADDED lines:      "
-            f"{added_count:,}\n"
-        )
+# ==========================================================
+# STATISTICS
+# ==========================================================
 
+def calculate_statistics(
+    comparisons,
+    keyword_rules
+):
 
-        output.write(
-            f"REMOVED lines:    "
-            f"{removed_count:,}\n"
-        )
+    stats = {
 
+        "nodes":
+            0,
 
-        output.write(
-            f"ADDED groups:     "
-            f"{added_groups:,}\n"
-        )
+        "matched_nodes":
+            0,
 
+        "a_only_nodes":
+            0,
 
-        output.write(
-            f"REMOVED groups:   "
-            f"{removed_groups:,}\n"
-        )
-
-
-    progress.finish()
-
-
-    return {
-
-        "same":
-            actual_same,
+        "b_only_nodes":
+            0,
 
         "changed":
-            changed_count,
+            0,
 
         "added":
-            added_count,
+            0,
 
         "removed":
-            removed_count,
+            0,
 
-        "report_records":
-            len(report_results)
+        "same":
+            0,
+
+        "keywords":
+            0
     }
+
+
+    for comparison in comparisons:
+
+        if (
+            comparison["kind"]
+            != "PREAMBLE"
+        ):
+
+            stats["nodes"] += 1
+
+
+        if (
+            comparison["kind"]
+            == "MATCH"
+        ):
+
+            stats[
+                "matched_nodes"
+            ] += 1
+
+
+        elif (
+            comparison["kind"]
+            == "A_ONLY"
+        ):
+
+            stats[
+                "a_only_nodes"
+            ] += 1
+
+
+        elif (
+            comparison["kind"]
+            == "B_ONLY"
+        ):
+
+            stats[
+                "b_only_nodes"
+            ] += 1
+
+
+        for result in (
+            comparison["results"]
+        ):
+
+            result_type = (
+                result["type"]
+            )
+
+
+            if result_type == "SAME":
+
+                stats["same"] += 1
+
+                if result_matches_rules(
+                    result,
+                    keyword_rules
+                ):
+
+                    stats[
+                        "keywords"
+                    ] += 1
+
+
+            elif result_type == "CHANGED":
+
+                stats[
+                    "changed"
+                ] += 1
+
+
+            elif result_type == "ADDED":
+
+                stats[
+                    "added"
+                ] += 1
+
+
+            elif result_type == "REMOVED":
+
+                stats[
+                    "removed"
+                ] += 1
+
+
+    return stats
 
 
 # ==========================================================
@@ -1611,6 +2941,7 @@ def main():
     if len(sys.argv) != 3:
 
         print()
+
         print(
             "Usage:"
         )
@@ -1633,10 +2964,6 @@ def main():
         sys.argv[2]
     )
 
-
-    # ======================================================
-    # CHECK FILES
-    # ======================================================
 
     if not Path(
         file_a
@@ -1668,27 +2995,61 @@ def main():
 
 
     # ======================================================
+    # RULES
+    # ======================================================
+
+    create_rule_files()
+
+
+    keyword_rules = (
+        load_rules(
+            KEYWORD_FILE
+        )
+    )
+
+
+    exclude_rules = (
+        load_rules(
+            EXCLUDE_FILE
+        )
+    )
+
+
+    print()
+
+    print(
+        f"Keywords loaded: "
+        f"{len(keyword_rules):,}"
+    )
+
+    print(
+        f"Excludes loaded: "
+        f"{len(exclude_rules):,}"
+    )
+
+
+    # ======================================================
     # READ FILE A
     # ======================================================
 
     print()
+
     print(
         f"Reading A: "
         f"{file_a}"
     )
 
 
-    (
-        original_a,
-        normalized_a
-    ) = read_file(
-        file_a
+    lines_a = (
+        read_file(
+            file_a
+        )
     )
 
 
     print(
         f"Lines A: "
-        f"{len(original_a):,}"
+        f"{len(lines_a):,}"
     )
 
 
@@ -1697,130 +3058,137 @@ def main():
     # ======================================================
 
     print()
+
     print(
         f"Reading B: "
         f"{file_b}"
     )
 
 
-    (
-        original_b,
-        normalized_b
-    ) = read_file(
-        file_b
+    lines_b = (
+        read_file(
+            file_b
+        )
     )
 
 
     print(
         f"Lines B: "
-        f"{len(original_b):,}"
+        f"{len(lines_b):,}"
     )
 
 
     # ======================================================
-    # SETTINGS
+    # SPLIT INTO NODE BLOCKS
     # ======================================================
 
     print()
-    print(
-        "=" * 70
-    )
 
     print(
-        "COMPARE SETTINGS"
-    )
-
-    print(
-        "=" * 70
+        "Finding Node name blocks..."
     )
 
 
-    print(
-        f"Ignore first columns : "
-        f"{IGNORE_FIRST_COLUMNS}"
+    (
+        preamble_a,
+        blocks_a
+    ) = split_into_node_blocks(
+        lines_a
     )
 
 
-    print(
-        f"Remove timestamps    : "
-        f"{REMOVE_TIMESTAMPS}"
+    (
+        preamble_b,
+        blocks_b
+    ) = split_into_node_blocks(
+        lines_b
     )
 
 
     print(
-        f"Show SAME            : "
-        f"{SHOW_SAME}"
+        f"Nodes A: "
+        f"{len(blocks_a):,}"
     )
 
-
     print(
-        f"Compress repeats     : "
-        f"{COMPRESS_REPEATS}"
-    )
-
-
-    print(
-        f"Minimum repeats      : "
-        f"{MIN_REPEAT_COUNT}"
-    )
-
-
-    print(
-        f"Change threshold     : "
-        f"{CHANGE_THRESHOLD * 100:.0f}%"
-    )
-
-
-    print(
-        f"Change window        : "
-        f"{CHANGE_WINDOW}"
-    )
-
-
-    print(
-        "=" * 70
+        f"Nodes B: "
+        f"{len(blocks_b):,}"
     )
 
 
     # ======================================================
-    # COMPARE
+    # BUILD NODE-ALIGNED COMPARISON
     # ======================================================
 
-    compare_start = (
-        time.perf_counter()
+    print()
+
+    print(
+        "Aligning Node name blocks..."
     )
 
 
-    results = compare_files(
-        original_a,
-        normalized_a,
-        original_b,
-        normalized_b
-    )
-
-
-    compare_elapsed = (
-        time.perf_counter()
-        - compare_start
+    comparisons = (
+        build_comparisons(
+            preamble_a,
+            blocks_a,
+            preamble_b,
+            blocks_b,
+            exclude_rules
+        )
     )
 
 
     # ======================================================
-    # WRITE REPORT
+    # STATISTICS
     # ======================================================
 
-    output_file = (
-        "compare_results.txt"
+    stats = (
+        calculate_statistics(
+            comparisons,
+            keyword_rules
+        )
     )
 
 
-    summary = write_report(
-        results,
+    # ======================================================
+    # TXT
+    # ======================================================
+
+    print()
+
+    print(
+        "Writing TXT report..."
+    )
+
+
+    write_text_report(
+        comparisons,
         file_a,
         file_b,
-        output_file
+        keyword_rules
     )
 
+
+    # ======================================================
+    # HTML
+    # ======================================================
+
+    print(
+        "Writing HTML report..."
+    )
+
+
+    write_html_report(
+        comparisons,
+        file_a,
+        file_b,
+        keyword_rules
+    )
+
+
+    # ======================================================
+    # DONE
+    # ======================================================
 
     total_elapsed = (
         time.perf_counter()
@@ -1828,11 +3196,8 @@ def main():
     )
 
 
-    # ======================================================
-    # FINAL
-    # ======================================================
-
     print()
+
     print(
         "=" * 70
     )
@@ -1847,72 +3212,85 @@ def main():
 
 
     print(
-        f"SAME:       "
-        f"{summary['same']:,}"
-        +
-        (
-            " (hidden)"
-            if not SHOW_SAME
-            else ""
-        )
+        f"Matched Nodes: "
+        f"{stats['matched_nodes']:,}"
     )
-
 
     print(
-        f"CHANGED:    "
-        f"{summary['changed']:,}"
+        f"Only in A:     "
+        f"{stats['a_only_nodes']:,}"
     )
-
 
     print(
-        f"ADDED:      "
-        f"{summary['added']:,}"
+        f"Only in B:     "
+        f"{stats['b_only_nodes']:,}"
     )
-
-
-    print(
-        f"REMOVED:    "
-        f"{summary['removed']:,}"
-    )
-
-
-    print(
-        f"Report rows:"
-        f" {summary['report_records']:,}"
-    )
-
 
     print(
         "-" * 70
     )
 
-
     print(
-        f"Compare time: "
-        f"{format_time(compare_elapsed)}"
+        f"SAME:          "
+        f"{stats['same']:,}"
     )
 
+    print(
+        f"KEYWORDS:      "
+        f"{stats['keywords']:,}"
+    )
 
     print(
-        f"Total time:   "
+        f"CHANGED:       "
+        f"{stats['changed']:,}"
+    )
+
+    print(
+        f"ADDED:         "
+        f"{stats['added']:,}"
+    )
+
+    print(
+        f"REMOVED:       "
+        f"{stats['removed']:,}"
+    )
+
+    print(
+        "-" * 70
+    )
+
+    print(
+        f"Total time:    "
         f"{format_time(total_elapsed)}"
     )
 
+    print()
 
     print(
-        f"Results:      "
-        f"{output_file}"
+        f"TXT report:    "
+        f"{TEXT_REPORT}"
     )
 
+    print(
+        f"HTML report:   "
+        f"{HTML_REPORT}"
+    )
+
+    print(
+        f"Keywords:      "
+        f"{KEYWORD_FILE}"
+    )
+
+    print(
+        f"Excludes:      "
+        f"{EXCLUDE_FILE}"
+    )
 
     print(
         "=" * 70
     )
 
 
-# ==========================================================
-# START
-# ==========================================================
-
 if __name__ == "__main__":
+
     main()
