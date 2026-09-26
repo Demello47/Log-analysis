@@ -1,6 +1,7 @@
 import sys
 import time
 import difflib
+import re
 from pathlib import Path
 
 
@@ -8,37 +9,54 @@ from pathlib import Path
 # SETTINGS
 # ==========================================================
 
-# Насколько строки должны быть похожи,
-# чтобы считать их CHANGED.
-#
-# 0.55 = 55%
+# Ignore first N whitespace-separated columns.
+# This affects comparison only.
+IGNORE_FIRST_COLUMNS = 5
+
+# Remove timestamps during comparison.
+REMOVE_TIMESTAMPS = True
+
+# Show SAME lines in report?
+SHOW_SAME = False
+
+# Compress consecutive identical ADDED / REMOVED lines.
+COMPRESS_REPEATS = True
+
+# Compress only if repeated at least this many times.
+MIN_REPEAT_COUNT = 3
+
+# Similarity required to consider two lines CHANGED.
 CHANGE_THRESHOLD = 0.55
 
-
-# Максимальное количество строк вокруг предполагаемой
-# позиции, которые проверяем при поиске CHANGED.
-#
-# Чем меньше число -> быстрее.
-# Чем больше -> выше шанс правильно сопоставить
-# сильно смещенные строки.
+# Search window when pairing CHANGED lines.
 CHANGE_WINDOW = 30
 
-
-# Если длина двух строк сильно отличается,
-# не запускаем дорогой SequenceMatcher.
-#
-# 0.60 означает:
-# короткая строка должна быть минимум 60%
-# длины длинной строки.
+# Cheap length filter.
 MIN_LENGTH_RATIO = 0.60
 
-
-# Размер progress bar
+# Progress settings.
 PROGRESS_BAR_WIDTH = 30
-
-
-# Как часто обновлять progress bar в секундах
 PROGRESS_UPDATE_SECONDS = 0.15
+
+
+# ==========================================================
+# TIMESTAMP REGEX
+# ==========================================================
+
+# Matches:
+#
+# 2026-08-05 08:40:33
+# 2026-08-05 08:40:33,333
+# 2026-08-05 08:40:33.333
+#
+TIMESTAMP_PATTERN = re.compile(
+    r"\b"
+    r"\d{4}-\d{2}-\d{2}"
+    r"\s+"
+    r"\d{2}:\d{2}:\d{2}"
+    r"(?:[,.]\d+)?"
+    r"\b"
+)
 
 
 # ==========================================================
@@ -56,19 +74,19 @@ def format_time(seconds):
     minutes = (seconds % 3600) // 60
     secs = seconds % 60
 
-    if hours > 0:
+    if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
     return f"{minutes:02d}:{secs:02d}"
 
 
 # ==========================================================
-# PROGRESS
+# PROGRESS BAR
 # ==========================================================
 
 class Progress:
 
-    def __init__(self, total, name="Comparing"):
+    def __init__(self, total, name="Processing"):
 
         self.total = max(total, 1)
         self.name = name
@@ -76,12 +94,10 @@ class Progress:
         self.start_time = time.perf_counter()
         self.last_update = 0
 
-        self.current = 0
-
 
     def update(self, current, force=False):
 
-        self.current = min(
+        current = min(
             current,
             self.total
         )
@@ -98,23 +114,18 @@ class Progress:
 
         self.last_update = now
 
-
         elapsed = (
             now - self.start_time
         )
 
-
         percentage = (
-            self.current
-            / self.total
+            current / self.total
         )
-
 
         filled = int(
             PROGRESS_BAR_WIDTH
             * percentage
         )
-
 
         bar = (
             "█" * filled
@@ -125,16 +136,10 @@ class Progress:
             )
         )
 
-
-        # --------------------------------------------------
-        # Speed
-        # --------------------------------------------------
-
         if elapsed > 0:
 
             speed = (
-                self.current
-                / elapsed
+                current / elapsed
             )
 
         else:
@@ -142,23 +147,14 @@ class Progress:
             speed = 0
 
 
-        # --------------------------------------------------
-        # ETA
-        # --------------------------------------------------
-
-        if (
-            speed > 0
-            and self.current > 0
-        ):
+        if speed > 0:
 
             remaining = (
-                self.total
-                - self.current
+                self.total - current
             )
 
             eta = (
-                remaining
-                / speed
+                remaining / speed
             )
 
             eta_text = format_time(
@@ -170,19 +166,14 @@ class Progress:
             eta_text = "--:--"
 
 
-        elapsed_text = format_time(
-            elapsed
-        )
-
-
         print(
             f"\r"
             f"{self.name}: "
             f"[{bar}] "
             f"{percentage * 100:6.2f}% "
-            f"| {self.current}/{self.total} "
+            f"| {current:,}/{self.total:,} "
             f"| {speed:,.0f} lines/s "
-            f"| Elapsed {elapsed_text} "
+            f"| Elapsed {format_time(elapsed)} "
             f"| ETA {eta_text}",
             end="",
             flush=True
@@ -200,12 +191,70 @@ class Progress:
 
 
 # ==========================================================
+# NORMALIZE LINE
+# ==========================================================
+
+def normalize_line(line):
+
+    text = line
+
+
+    # ======================================================
+    # STEP 1
+    # Remove first N columns
+    # ======================================================
+
+    if IGNORE_FIRST_COLUMNS > 0:
+
+        parts = text.split()
+
+        if len(parts) <= IGNORE_FIRST_COLUMNS:
+
+            text = ""
+
+        else:
+
+            text = " ".join(
+                parts[
+                    IGNORE_FIRST_COLUMNS:
+                ]
+            )
+
+
+    # ======================================================
+    # STEP 2
+    # Remove timestamps
+    # ======================================================
+
+    if REMOVE_TIMESTAMPS:
+
+        text = TIMESTAMP_PATTERN.sub(
+            "",
+            text
+        )
+
+
+    # ======================================================
+    # STEP 3
+    # Clean spaces
+    # ======================================================
+
+    text = " ".join(
+        text.split()
+    )
+
+
+    return text
+
+
+# ==========================================================
 # READ FILE
 # ==========================================================
 
 def read_file(path):
 
-    lines = []
+    original_lines = []
+    normalized_lines = []
 
     with open(
         path,
@@ -216,15 +265,29 @@ def read_file(path):
 
         for line in file:
 
-            lines.append(
-                line.rstrip("\r\n")
+            original = line.rstrip(
+                "\r\n"
             )
 
-    return lines
+            original_lines.append(
+                original
+            )
+
+            normalized_lines.append(
+                normalize_line(
+                    original
+                )
+            )
+
+
+    return (
+        original_lines,
+        normalized_lines
+    )
 
 
 # ==========================================================
-# FAST LENGTH CHECK
+# LENGTH FILTER
 # ==========================================================
 
 def length_is_reasonable(
@@ -236,7 +299,6 @@ def length_is_reasonable(
     len_b = len(line_b)
 
 
-    # Both empty
     if (
         len_a == 0
         and len_b == 0
@@ -244,7 +306,6 @@ def length_is_reasonable(
         return True
 
 
-    # One empty
     if (
         len_a == 0
         or len_b == 0
@@ -264,8 +325,7 @@ def length_is_reasonable(
 
 
     ratio = (
-        shorter
-        / longer
+        shorter / longer
     )
 
 
@@ -275,7 +335,7 @@ def length_is_reasonable(
 
 
 # ==========================================================
-# LINE SIMILARITY
+# SIMILARITY
 # ==========================================================
 
 def similarity(
@@ -283,12 +343,10 @@ def similarity(
     line_b
 ):
 
-    # Exact match
     if line_a == line_b:
         return 1.0
 
 
-    # Cheap length filter first
     if not length_is_reasonable(
         line_a,
         line_b
@@ -304,17 +362,11 @@ def similarity(
     )
 
 
-    # ------------------------------------------------------
-    # quick_ratio() is cheaper than ratio().
-    #
-    # If even quick estimate is below threshold,
-    # don't calculate full ratio.
-    # ------------------------------------------------------
-
-    quick = matcher.quick_ratio()
-
-
-    if quick < CHANGE_THRESHOLD:
+    # Cheap check first.
+    if (
+        matcher.quick_ratio()
+        < CHANGE_THRESHOLD
+    ):
         return 0.0
 
 
@@ -322,13 +374,50 @@ def similarity(
 
 
 # ==========================================================
-# PAIR REPLACED LINES
-#
-# Try to determine whether:
-#
-# removed line + added line
-#
-# are actually one CHANGED line.
+# CREATE RESULT
+# ==========================================================
+
+def make_result(
+    result_type,
+    old_line=None,
+    new_line=None,
+    old_text=None,
+    new_text=None,
+    old_compare=None,
+    new_compare=None,
+    similarity_value=None
+):
+
+    return {
+
+        "type":
+            result_type,
+
+        "old_line":
+            old_line,
+
+        "new_line":
+            new_line,
+
+        "old_text":
+            old_text,
+
+        "new_text":
+            new_text,
+
+        "old_compare":
+            old_compare,
+
+        "new_compare":
+            new_compare,
+
+        "similarity":
+            similarity_value
+    }
+
+
+# ==========================================================
+# PAIR CHANGED LINES
 # ==========================================================
 
 def pair_changed_lines(
@@ -340,80 +429,6 @@ def pair_changed_lines(
 
     used_added = set()
 
-
-    # ------------------------------------------------------
-    # Nothing on one side
-    # ------------------------------------------------------
-
-    if not removed:
-
-        for (
-            new_line_num,
-            new_text
-        ) in added:
-
-            results.append({
-
-                "type":
-                    "ADDED",
-
-                "old_line":
-                    None,
-
-                "new_line":
-                    new_line_num,
-
-                "old_text":
-                    None,
-
-                "new_text":
-                    new_text,
-
-                "similarity":
-                    None
-            })
-
-        return results
-
-
-    if not added:
-
-        for (
-            old_line_num,
-            old_text
-        ) in removed:
-
-            results.append({
-
-                "type":
-                    "REMOVED",
-
-                "old_line":
-                    old_line_num,
-
-                "new_line":
-                    None,
-
-                "old_text":
-                    old_text,
-
-                "new_text":
-                    None,
-
-                "similarity":
-                    None
-            })
-
-        return results
-
-
-    # ------------------------------------------------------
-    # Position mapping
-    #
-    # If block sizes differ, estimate where each removed
-    # line should be located on the added side.
-    # ------------------------------------------------------
-
     removed_count = len(
         removed
     )
@@ -423,19 +438,79 @@ def pair_changed_lines(
     )
 
 
-    for removed_index, (
-        old_line_num,
-        old_text
+    # ======================================================
+    # ONLY ADDED
+    # ======================================================
+
+    if removed_count == 0:
+
+        for item in added:
+
+            results.append(
+                make_result(
+                    "ADDED",
+
+                    new_line=
+                        item["line"],
+
+                    new_text=
+                        item["text"],
+
+                    new_compare=
+                        item["compare"]
+                )
+            )
+
+        return results
+
+
+    # ======================================================
+    # ONLY REMOVED
+    # ======================================================
+
+    if added_count == 0:
+
+        for item in removed:
+
+            results.append(
+                make_result(
+                    "REMOVED",
+
+                    old_line=
+                        item["line"],
+
+                    old_text=
+                        item["text"],
+
+                    old_compare=
+                        item["compare"]
+                )
+            )
+
+        return results
+
+
+    # ======================================================
+    # FIND CHANGED PAIRS
+    # ======================================================
+
+    for (
+        removed_index,
+        old_item
     ) in enumerate(
         removed
     ):
+
+        old_compare = (
+            old_item["compare"]
+        )
 
         best_index = None
         best_score = 0.0
 
 
         # --------------------------------------------------
-        # Estimate corresponding position
+        # Estimate position
         # --------------------------------------------------
 
         if removed_count <= 1:
@@ -446,14 +521,17 @@ def pair_changed_lines(
 
             position_ratio = (
                 removed_index
-                / (
-                    removed_count - 1
+                /
+                (
+                    removed_count
+                    - 1
                 )
             )
 
             estimated_index = int(
                 position_ratio
-                * max(
+                *
+                max(
                     added_count - 1,
                     0
                 )
@@ -461,89 +539,51 @@ def pair_changed_lines(
 
 
         # --------------------------------------------------
-        # Search only near estimated position
-        # --------------------------------------------------
-
-        start_index = max(
-            0,
-            estimated_index
-            - CHANGE_WINDOW
-        )
-
-        end_index = min(
-            added_count,
-            estimated_index
-            + CHANGE_WINDOW
-            + 1
-        )
-
-
-        # --------------------------------------------------
-        # First try exact same relative position.
-        #
-        # This is extremely common in logs.
+        # Candidate positions
         # --------------------------------------------------
 
         candidate_order = []
 
 
-        if (
-            estimated_index
-            >= start_index
-            and estimated_index
-            < end_index
-        ):
-
-            candidate_order.append(
-                estimated_index
-            )
-
-
-        # --------------------------------------------------
-        # Then expand around position:
-        #
-        # 0
-        # -1
-        # +1
-        # -2
-        # +2
-        # ...
-        # --------------------------------------------------
-
         for distance in range(
-            1,
+            0,
             CHANGE_WINDOW + 1
         ):
 
-            left = (
-                estimated_index
-                - distance
-            )
+            if distance == 0:
 
-            right = (
-                estimated_index
-                + distance
-            )
+                candidates = [
+                    estimated_index
+                ]
 
+            else:
 
-            if (
-                left >= start_index
-                and left < end_index
-            ):
+                candidates = [
 
-                candidate_order.append(
-                    left
-                )
+                    estimated_index
+                    - distance,
+
+                    estimated_index
+                    + distance
+                ]
 
 
-            if (
-                right >= start_index
-                and right < end_index
-            ):
+            for candidate in candidates:
 
-                candidate_order.append(
-                    right
-                )
+                if (
+                    0
+                    <= candidate
+                    < added_count
+                ):
+
+                    if (
+                        candidate
+                        not in candidate_order
+                    ):
+
+                        candidate_order.append(
+                            candidate
+                        )
 
 
         # --------------------------------------------------
@@ -556,23 +596,25 @@ def pair_changed_lines(
                 continue
 
 
-            (
-                new_line_num,
-                new_text
-            ) = added[index]
+            new_item = (
+                added[index]
+            )
+
+            new_compare = (
+                new_item["compare"]
+            )
 
 
-            # Cheap length check
             if not length_is_reasonable(
-                old_text,
-                new_text
+                old_compare,
+                new_compare
             ):
                 continue
 
 
             score = similarity(
-                old_text,
-                new_text
+                old_compare,
+                new_compare
             )
 
 
@@ -583,27 +625,26 @@ def pair_changed_lines(
 
 
             # Very strong match.
-            # No need to continue searching.
             if best_score >= 0.98:
                 break
 
 
-        # --------------------------------------------------
+        # ==================================================
         # CHANGED
-        # --------------------------------------------------
+        # ==================================================
 
         if (
             best_index is not None
-            and best_score
+            and
+            best_score
             >= CHANGE_THRESHOLD
         ):
 
-            (
-                new_line_num,
-                new_text
-            ) = added[
-                best_index
-            ]
+            new_item = (
+                added[
+                    best_index
+                ]
+            )
 
 
             used_added.add(
@@ -611,63 +652,63 @@ def pair_changed_lines(
             )
 
 
-            results.append({
-
-                "type":
+            results.append(
+                make_result(
                     "CHANGED",
 
-                "old_line":
-                    old_line_num,
+                    old_line=
+                        old_item["line"],
 
-                "new_line":
-                    new_line_num,
+                    new_line=
+                        new_item["line"],
 
-                "old_text":
-                    old_text,
+                    old_text=
+                        old_item["text"],
 
-                "new_text":
-                    new_text,
+                    new_text=
+                        new_item["text"],
 
-                "similarity":
-                    best_score
-            })
+                    old_compare=
+                        old_item["compare"],
+
+                    new_compare=
+                        new_item["compare"],
+
+                    similarity_value=
+                        best_score
+                )
+            )
 
 
-        # --------------------------------------------------
+        # ==================================================
         # REMOVED
-        # --------------------------------------------------
+        # ==================================================
 
         else:
 
-            results.append({
-
-                "type":
+            results.append(
+                make_result(
                     "REMOVED",
 
-                "old_line":
-                    old_line_num,
+                    old_line=
+                        old_item["line"],
 
-                "new_line":
-                    None,
+                    old_text=
+                        old_item["text"],
 
-                "old_text":
-                    old_text,
-
-                "new_text":
-                    None,
-
-                "similarity":
-                    None
-            })
+                    old_compare=
+                        old_item["compare"]
+                )
+            )
 
 
-    # ------------------------------------------------------
-    # Remaining added lines
-    # ------------------------------------------------------
+    # ======================================================
+    # REMAINING ADDED
+    # ======================================================
 
-    for index, (
-        new_line_num,
-        new_text
+    for (
+        index,
+        new_item
     ) in enumerate(
         added
     ):
@@ -676,26 +717,20 @@ def pair_changed_lines(
             continue
 
 
-        results.append({
-
-            "type":
+        results.append(
+            make_result(
                 "ADDED",
 
-            "old_line":
-                None,
+                new_line=
+                    new_item["line"],
 
-            "new_line":
-                new_line_num,
+                new_text=
+                    new_item["text"],
 
-            "old_text":
-                None,
-
-            "new_text":
-                new_text,
-
-            "similarity":
-                None
-        })
+                new_compare=
+                    new_item["compare"]
+            )
+        )
 
 
     return results
@@ -706,8 +741,10 @@ def pair_changed_lines(
 # ==========================================================
 
 def compare_files(
-    lines_a,
-    lines_b
+    original_a,
+    normalized_a,
+    original_b,
+    normalized_b
 ):
 
     print()
@@ -716,36 +753,28 @@ def compare_files(
     )
 
 
-    # ======================================================
-    # MAIN SEQUENCE MATCHER
-    #
-    # autojunk=True is important for large repetitive logs.
-    # ======================================================
-
     matcher = difflib.SequenceMatcher(
         None,
-        lines_a,
-        lines_b,
+        normalized_a,
+        normalized_b,
         autojunk=True
     )
 
 
-    opcodes = matcher.get_opcodes()
+    opcodes = (
+        matcher.get_opcodes()
+    )
 
 
     print(
         f"Comparison blocks: "
-        f"{len(opcodes)}"
+        f"{len(opcodes):,}"
     )
 
 
-    # ======================================================
-    # Progress is based on the larger input file.
-    # ======================================================
-
     total_lines = max(
-        len(lines_a),
-        len(lines_b)
+        len(normalized_a),
+        len(normalized_b)
     )
 
 
@@ -796,37 +825,40 @@ def compare_files(
                 )
 
 
-                results.append({
-
-                    "type":
+                results.append(
+                    make_result(
                         "SAME",
 
-                    "old_line":
-                        old_index + 1,
+                        old_line=
+                            old_index + 1,
 
-                    "new_line":
-                        new_index + 1,
+                        new_line=
+                            new_index + 1,
 
-                    "old_text":
-                        lines_a[
-                            old_index
-                        ],
+                        old_text=
+                            original_a[
+                                old_index
+                            ],
 
-                    "new_text":
-                        lines_b[
-                            new_index
-                        ],
+                        new_text=
+                            original_b[
+                                new_index
+                            ],
 
-                    "similarity":
-                        1.0
-                })
+                        old_compare=
+                            normalized_a[
+                                old_index
+                            ],
 
+                        new_compare=
+                            normalized_b[
+                                new_index
+                            ],
 
-            processed = max(
-                processed,
-                a_end,
-                b_end
-            )
+                        similarity_value=
+                            1.0
+                    )
+                )
 
 
         # ==================================================
@@ -840,35 +872,24 @@ def compare_files(
                 a_end
             ):
 
-                results.append({
-
-                    "type":
+                results.append(
+                    make_result(
                         "REMOVED",
 
-                    "old_line":
-                        index + 1,
+                        old_line=
+                            index + 1,
 
-                    "new_line":
-                        None,
+                        old_text=
+                            original_a[
+                                index
+                            ],
 
-                    "old_text":
-                        lines_a[
-                            index
-                        ],
-
-                    "new_text":
-                        None,
-
-                    "similarity":
-                        None
-                })
-
-
-            processed = max(
-                processed,
-                a_end,
-                b_end
-            )
+                        old_compare=
+                            normalized_a[
+                                index
+                            ]
+                    )
+                )
 
 
         # ==================================================
@@ -882,35 +903,24 @@ def compare_files(
                 b_end
             ):
 
-                results.append({
-
-                    "type":
+                results.append(
+                    make_result(
                         "ADDED",
 
-                    "old_line":
-                        None,
+                        new_line=
+                            index + 1,
 
-                    "new_line":
-                        index + 1,
+                        new_text=
+                            original_b[
+                                index
+                            ],
 
-                    "old_text":
-                        None,
-
-                    "new_text":
-                        lines_b[
-                            index
-                        ],
-
-                    "similarity":
-                        None
-                })
-
-
-            processed = max(
-                processed,
-                a_end,
-                b_end
-            )
+                        new_compare=
+                            normalized_b[
+                                index
+                            ]
+                    )
+                )
 
 
         # ==================================================
@@ -919,36 +929,53 @@ def compare_files(
 
         elif tag == "replace":
 
-            removed = [
+            removed = []
 
-                (
-                    index + 1,
-                    lines_a[
-                        index
-                    ]
-                )
-
-                for index in range(
-                    a_start,
-                    a_end
-                )
-            ]
+            added = []
 
 
-            added = [
+            for index in range(
+                a_start,
+                a_end
+            ):
 
-                (
-                    index + 1,
-                    lines_b[
-                        index
-                    ]
-                )
+                removed.append({
 
-                for index in range(
-                    b_start,
-                    b_end
-                )
-            ]
+                    "line":
+                        index + 1,
+
+                    "text":
+                        original_a[
+                            index
+                        ],
+
+                    "compare":
+                        normalized_a[
+                            index
+                        ]
+                })
+
+
+            for index in range(
+                b_start,
+                b_end
+            ):
+
+                added.append({
+
+                    "line":
+                        index + 1,
+
+                    "text":
+                        original_b[
+                            index
+                        ],
+
+                    "compare":
+                        normalized_b[
+                            index
+                        ]
+                })
 
 
             block_results = (
@@ -964,11 +991,11 @@ def compare_files(
             )
 
 
-            processed = max(
-                processed,
-                a_end,
-                b_end
-            )
+        processed = max(
+            processed,
+            a_end,
+            b_end
+        )
 
 
         progress.update(
@@ -978,8 +1005,247 @@ def compare_files(
 
     progress.finish()
 
-
     return results
+
+
+# ==========================================================
+# CAN COMPRESS?
+# ==========================================================
+
+def can_compress(
+    previous,
+    current
+):
+
+    if previous["type"] not in (
+        "ADDED",
+        "REMOVED"
+    ):
+        return False
+
+
+    if (
+        current["type"]
+        != previous["type"]
+    ):
+        return False
+
+
+    # ======================================================
+    # REMOVED
+    # ======================================================
+
+    if current["type"] == "REMOVED":
+
+        if (
+            current["old_compare"]
+            != previous["old_compare"]
+        ):
+            return False
+
+
+        if (
+            current["old_line"]
+            != previous["old_line"] + 1
+        ):
+            return False
+
+
+    # ======================================================
+    # ADDED
+    # ======================================================
+
+    elif current["type"] == "ADDED":
+
+        if (
+            current["new_compare"]
+            != previous["new_compare"]
+        ):
+            return False
+
+
+        if (
+            current["new_line"]
+            != previous["new_line"] + 1
+        ):
+            return False
+
+
+    return True
+
+
+# ==========================================================
+# COMPRESS RESULTS
+# ==========================================================
+
+def compress_results(
+    results
+):
+
+    if not COMPRESS_REPEATS:
+        return results
+
+
+    compressed = []
+
+    index = 0
+
+
+    while index < len(results):
+
+        current = (
+            results[index]
+        )
+
+
+        # SAME / CHANGED are not compressed here.
+        if current["type"] not in (
+            "ADDED",
+            "REMOVED"
+        ):
+
+            compressed.append(
+                current
+            )
+
+            index += 1
+            continue
+
+
+        group = [
+            current
+        ]
+
+
+        next_index = (
+            index + 1
+        )
+
+
+        while (
+            next_index
+            < len(results)
+        ):
+
+            previous = (
+                group[-1]
+            )
+
+            candidate = (
+                results[
+                    next_index
+                ]
+            )
+
+
+            if not can_compress(
+                previous,
+                candidate
+            ):
+                break
+
+
+            group.append(
+                candidate
+            )
+
+
+            next_index += 1
+
+
+        # ==================================================
+        # CREATE GROUP
+        # ==================================================
+
+        if (
+            len(group)
+            >= MIN_REPEAT_COUNT
+        ):
+
+            first = group[0]
+            last = group[-1]
+
+
+            # ==============================================
+            # REMOVED GROUP
+            # ==============================================
+
+            if (
+                current["type"]
+                == "REMOVED"
+            ):
+
+                compressed.append({
+
+                    "type":
+                        "REMOVED_GROUP",
+
+                    "count":
+                        len(group),
+
+                    "start_line":
+                        first[
+                            "old_line"
+                        ],
+
+                    "end_line":
+                        last[
+                            "old_line"
+                        ],
+
+                    "compare":
+                        first[
+                            "old_compare"
+                        ]
+                })
+
+
+            # ==============================================
+            # ADDED GROUP
+            # ==============================================
+
+            else:
+
+                compressed.append({
+
+                    "type":
+                        "ADDED_GROUP",
+
+                    "count":
+                        len(group),
+
+                    "start_line":
+                        first[
+                            "new_line"
+                        ],
+
+                    "end_line":
+                        last[
+                            "new_line"
+                        ],
+
+                    "compare":
+                        first[
+                            "new_compare"
+                        ]
+                })
+
+
+        # ==================================================
+        # KEEP INDIVIDUAL
+        # ==================================================
+
+        else:
+
+            compressed.extend(
+                group
+            )
+
+
+        index = next_index
+
+
+    return compressed
 
 
 # ==========================================================
@@ -993,20 +1259,62 @@ def write_report(
     output_file
 ):
 
+    name_a = Path(
+        file_a
+    ).name
+
+    name_b = Path(
+        file_b
+    ).name
+
+
+    changed_count = 0
+    added_count = 0
+    removed_count = 0
+
+    added_groups = 0
+    removed_groups = 0
+
+
+    actual_same = sum(
+        1
+        for item in results
+        if item["type"] == "SAME"
+    )
+
+
+    print()
+    print(
+        "Compressing repeated events..."
+    )
+
+
+    report_results = (
+        compress_results(
+            results
+        )
+    )
+
+
+    print(
+        f"Raw results:    "
+        f"{len(results):,}"
+    )
+
+    print(
+        f"Report records: "
+        f"{len(report_results):,}"
+    )
+
+
     print()
     print(
         "Writing report..."
     )
 
 
-    same_count = 0
-    changed_count = 0
-    added_count = 0
-    removed_count = 0
-
-
     progress = Progress(
-        len(results),
+        len(report_results),
         "Writing"
     )
 
@@ -1018,28 +1326,17 @@ def write_report(
     ) as output:
 
 
-        output.write(
-            f"FILE A: {file_a}\n"
-        )
-
-        output.write(
-            f"FILE B: {file_b}\n"
-        )
-
-        output.write(
-            "=" * 80
-            + "\n\n"
-        )
-
-
-        for index, item in enumerate(
-            results,
+        for (
+            index,
+            item
+        ) in enumerate(
+            report_results,
             start=1
         ):
 
-            item_type = item[
-                "type"
-            ]
+            item_type = (
+                item["type"]
+            )
 
 
             # ==============================================
@@ -1048,15 +1345,21 @@ def write_report(
 
             if item_type == "SAME":
 
-                same_count += 1
+                if SHOW_SAME:
 
+                    output.write(
+                        "[SAME]\n"
+                    )
 
-                output.write(
-                    f"[SAME] "
-                    f"A:{item['old_line']} "
-                    f"B:{item['new_line']} "
-                    f"{item['old_text']}\n"
-                )
+                    output.write(
+                        f"  "
+                        f"{item['old_compare']}    "
+                        f"[{name_a}:"
+                        f"{item['old_line']} "
+                        f"| "
+                        f"{name_b}:"
+                        f"{item['new_line']}]\n\n"
+                    )
 
 
             # ==============================================
@@ -1069,18 +1372,13 @@ def write_report(
 
 
                 percent = (
-                    item[
-                        "similarity"
-                    ]
+                    item["similarity"]
                     * 100
                 )
 
 
                 output.write(
-                    "\n"
                     f"[CHANGED] "
-                    f"A:{item['old_line']} "
-                    f"B:{item['new_line']} "
                     f"Similarity: "
                     f"{percent:.1f}%\n"
                 )
@@ -1088,35 +1386,17 @@ def write_report(
 
                 output.write(
                     f"< "
-                    f"{item['old_text']}\n"
+                    f"{item['old_compare']}    "
+                    f"[{name_a}:"
+                    f"{item['old_line']}]\n"
                 )
 
 
                 output.write(
                     f"> "
-                    f"{item['new_text']}\n"
-                )
-
-
-            # ==============================================
-            # ADDED
-            # ==============================================
-
-            elif item_type == "ADDED":
-
-                added_count += 1
-
-
-                output.write(
-                    "\n"
-                    f"[ADDED] "
-                    f"B:{item['new_line']}\n"
-                )
-
-
-                output.write(
-                    f"> "
-                    f"{item['new_text']}\n"
+                    f"{item['new_compare']}    "
+                    f"[{name_b}:"
+                    f"{item['new_line']}]\n\n"
                 )
 
 
@@ -1130,15 +1410,101 @@ def write_report(
 
 
                 output.write(
-                    "\n"
-                    f"[REMOVED] "
-                    f"A:{item['old_line']}\n"
+                    "[REMOVED]\n"
                 )
 
 
                 output.write(
                     f"< "
-                    f"{item['old_text']}\n"
+                    f"{item['old_compare']}    "
+                    f"[{name_a}:"
+                    f"{item['old_line']}]\n\n"
+                )
+
+
+            # ==============================================
+            # ADDED
+            # ==============================================
+
+            elif item_type == "ADDED":
+
+                added_count += 1
+
+
+                output.write(
+                    "[ADDED]\n"
+                )
+
+
+                output.write(
+                    f"> "
+                    f"{item['new_compare']}    "
+                    f"[{name_b}:"
+                    f"{item['new_line']}]\n\n"
+                )
+
+
+            # ==============================================
+            # REMOVED GROUP
+            # ==============================================
+
+            elif (
+                item_type
+                == "REMOVED_GROUP"
+            ):
+
+                removed_count += (
+                    item["count"]
+                )
+
+                removed_groups += 1
+
+
+                output.write(
+                    f"[REMOVED ×"
+                    f"{item['count']}]\n"
+                )
+
+
+                output.write(
+                    f"< "
+                    f"{item['compare']}    "
+                    f"[{name_a}:"
+                    f"{item['start_line']}"
+                    f"-"
+                    f"{item['end_line']}]\n\n"
+                )
+
+
+            # ==============================================
+            # ADDED GROUP
+            # ==============================================
+
+            elif (
+                item_type
+                == "ADDED_GROUP"
+            ):
+
+                added_count += (
+                    item["count"]
+                )
+
+                added_groups += 1
+
+
+                output.write(
+                    f"[ADDED ×"
+                    f"{item['count']}]\n"
+                )
+
+
+                output.write(
+                    f"> "
+                    f"{item['compare']}    "
+                    f"[{name_b}:"
+                    f"{item['start_line']}"
+                    f"-"
+                    f"{item['end_line']}]\n\n"
                 )
 
 
@@ -1152,16 +1518,13 @@ def write_report(
         # ==================================================
 
         output.write(
-            "\n"
-            + "=" * 80
+            "=" * 80
             + "\n"
         )
-
 
         output.write(
             "SUMMARY\n"
         )
-
 
         output.write(
             "=" * 80
@@ -1170,26 +1533,50 @@ def write_report(
 
 
         output.write(
-            f"SAME:    "
-            f"{same_count}\n"
+            f"SAME:             "
+            f"{actual_same:,}"
+        )
+
+
+        if not SHOW_SAME:
+
+            output.write(
+                " (hidden)"
+            )
+
+
+        output.write(
+            "\n"
         )
 
 
         output.write(
-            f"CHANGED: "
-            f"{changed_count}\n"
+            f"CHANGED:          "
+            f"{changed_count:,}\n"
         )
 
 
         output.write(
-            f"ADDED:   "
-            f"{added_count}\n"
+            f"ADDED lines:      "
+            f"{added_count:,}\n"
         )
 
 
         output.write(
-            f"REMOVED: "
-            f"{removed_count}\n"
+            f"REMOVED lines:    "
+            f"{removed_count:,}\n"
+        )
+
+
+        output.write(
+            f"ADDED groups:     "
+            f"{added_groups:,}\n"
+        )
+
+
+        output.write(
+            f"REMOVED groups:   "
+            f"{removed_groups:,}\n"
         )
 
 
@@ -1197,10 +1584,21 @@ def write_report(
 
 
     return {
-        "same": same_count,
-        "changed": changed_count,
-        "added": added_count,
-        "removed": removed_count
+
+        "same":
+            actual_same,
+
+        "changed":
+            changed_count,
+
+        "added":
+            added_count,
+
+        "removed":
+            removed_count,
+
+        "report_records":
+            len(report_results)
     }
 
 
@@ -1227,12 +1625,17 @@ def main():
         sys.exit(1)
 
 
-    file_a = sys.argv[1]
-    file_b = sys.argv[2]
+    file_a = (
+        sys.argv[1]
+    )
+
+    file_b = (
+        sys.argv[2]
+    )
 
 
     # ======================================================
-    # CHECK FILE A
+    # CHECK FILES
     # ======================================================
 
     if not Path(
@@ -1246,10 +1649,6 @@ def main():
 
         sys.exit(1)
 
-
-    # ======================================================
-    # CHECK FILE B
-    # ======================================================
 
     if not Path(
         file_b
@@ -1269,7 +1668,7 @@ def main():
 
 
     # ======================================================
-    # READ A
+    # READ FILE A
     # ======================================================
 
     print()
@@ -1279,19 +1678,22 @@ def main():
     )
 
 
-    lines_a = read_file(
+    (
+        original_a,
+        normalized_a
+    ) = read_file(
         file_a
     )
 
 
     print(
         f"Lines A: "
-        f"{len(lines_a):,}"
+        f"{len(original_a):,}"
     )
 
 
     # ======================================================
-    # READ B
+    # READ FILE B
     # ======================================================
 
     print()
@@ -1301,19 +1703,22 @@ def main():
     )
 
 
-    lines_b = read_file(
+    (
+        original_b,
+        normalized_b
+    ) = read_file(
         file_b
     )
 
 
     print(
         f"Lines B: "
-        f"{len(lines_b):,}"
+        f"{len(original_b):,}"
     )
 
 
     # ======================================================
-    # INFO
+    # SETTINGS
     # ======================================================
 
     print()
@@ -1331,20 +1736,44 @@ def main():
 
 
     print(
-        f"Change threshold : "
+        f"Ignore first columns : "
+        f"{IGNORE_FIRST_COLUMNS}"
+    )
+
+
+    print(
+        f"Remove timestamps    : "
+        f"{REMOVE_TIMESTAMPS}"
+    )
+
+
+    print(
+        f"Show SAME            : "
+        f"{SHOW_SAME}"
+    )
+
+
+    print(
+        f"Compress repeats     : "
+        f"{COMPRESS_REPEATS}"
+    )
+
+
+    print(
+        f"Minimum repeats      : "
+        f"{MIN_REPEAT_COUNT}"
+    )
+
+
+    print(
+        f"Change threshold     : "
         f"{CHANGE_THRESHOLD * 100:.0f}%"
     )
 
 
     print(
-        f"Change window    : "
+        f"Change window        : "
         f"{CHANGE_WINDOW}"
-    )
-
-
-    print(
-        f"Length ratio     : "
-        f"{MIN_LENGTH_RATIO * 100:.0f}%"
     )
 
 
@@ -1363,8 +1792,10 @@ def main():
 
 
     results = compare_files(
-        lines_a,
-        lines_b
+        original_a,
+        normalized_a,
+        original_b,
+        normalized_b
     )
 
 
@@ -1375,7 +1806,7 @@ def main():
 
 
     # ======================================================
-    # REPORT
+    # WRITE REPORT
     # ======================================================
 
     output_file = (
@@ -1391,15 +1822,15 @@ def main():
     )
 
 
-    # ======================================================
-    # FINISHED
-    # ======================================================
-
     total_elapsed = (
         time.perf_counter()
         - total_start
     )
 
+
+    # ======================================================
+    # FINAL
+    # ======================================================
 
     print()
     print(
@@ -1416,26 +1847,38 @@ def main():
 
 
     print(
-        f"SAME:    "
+        f"SAME:       "
         f"{summary['same']:,}"
+        +
+        (
+            " (hidden)"
+            if not SHOW_SAME
+            else ""
+        )
     )
 
 
     print(
-        f"CHANGED: "
+        f"CHANGED:    "
         f"{summary['changed']:,}"
     )
 
 
     print(
-        f"ADDED:   "
+        f"ADDED:      "
         f"{summary['added']:,}"
     )
 
 
     print(
-        f"REMOVED: "
+        f"REMOVED:    "
         f"{summary['removed']:,}"
+    )
+
+
+    print(
+        f"Report rows:"
+        f" {summary['report_records']:,}"
     )
 
 
